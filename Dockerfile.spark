@@ -1,0 +1,18 @@
+# Dockerfile.spark
+FROM bitnamilegacy/spark:3.5.1
+
+# Bitnami mặc định chạy user 1001. Ta phải mượn quyền root để dùng pip install
+USER root
+
+# Copy file requirements vào container
+COPY requirements.txt /tmp/requirements.txt
+
+# Cài đặt thư viện (XGBoost, Pandas, Delta-spark, v.v.)
+RUN pip install --no-cache-dir -r /tmp/requirements.txt
+
+# Tạo sẵn các thư mục data và phân quyền để Spark không bị lỗi Permission Denied
+RUN mkdir -p /app/data /app/models /app/code && \
+    chown -R 1001:1001 /app
+
+# Trả lại quyền user mặc định của Bitnami
+USER 1001
