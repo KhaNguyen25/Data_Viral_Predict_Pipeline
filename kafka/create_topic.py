@@ -1,27 +1,36 @@
-from confluent_kafka.admin import AdminClient, NewTopic
+from kafka.admin import KafkaAdminClient, NewTopic
+from kafka.errors import TopicAlreadyExistsError
 
 def create_log_topic():
-    # Khởi tạo AdminClient trỏ vào cổng Kafka
-    admin_client = AdminClient({'bootstrap.servers': 'localhost:9092'})
+    print("Khởi tạo Admin Client kết nối tới Kafka...")
+    admin_client = KafkaAdminClient(
+        bootstrap_servers="kafka:9092",  # Đồng bộ gọi tên mạng Docker
+        client_id='edge_node_setup'
+    )
+
     topic_name = "edge_node_req_logs"
     
-    # Thiết lập topic
-    new_topic = NewTopic(
-        topic=topic_name, 
+    # Thiết lập topic cho Raw Logs (Giữ trong 1 ngày = 86.400.000 ms)
+    topic_list = [NewTopic(
+        name=topic_name,
         num_partitions=3, 
         replication_factor=1,
-        config={
+        topic_configs={
             'retention.ms': '86400000', 
             'cleanup.policy': 'delete'
         }
-    )
+    )]
 
-    # Tạo topic
-    fs = admin_client.create_topics([new_topic])
-    
-    for topic, future in fs.items():
-        try:
-            future.result()
-            print(f"Thành công: Đã tạo topic '{topic}'")
-        except Exception as e:
-            print(f"Topic '{topic}' có thể đã tồn tại: {e}")
+    try:
+        print(f"Đang tạo topic '{topic_name}'...")
+        admin_client.create_topics(new_topics=topic_list, validate_only=False)
+        print(f"✅ Đã tạo Topic '{topic_name}' thành công!")
+    except TopicAlreadyExistsError:
+        print(f"⚠️ Topic '{topic_name}' đã tồn tại từ trước.")
+    except Exception as e:
+        print(f"❌ Lỗi khi tạo topic: {e}")
+    finally:
+        admin_client.close()
+
+if __name__ == "__main__":
+    create_log_topic()

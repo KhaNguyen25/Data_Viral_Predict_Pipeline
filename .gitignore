@@ -1,20 +1,56 @@
+# =========================
+# 1. BIG DATA & DATABASE
+# =========================
 data/
 kafka_data/
-*.csv
-*.json
 *.parquet
+*.csv
 
+# =========================
+# 2. MACHINE LEARNING MODELS
+# =========================
+# Bỏ qua các file model nặng sinh ra tự động
+*.json
+*.model
+*.bin
+# (Lưu ý: Hãy tạo 1 file tên .gitkeep đặt vào thư mục models/ để giữ lại cấu trúc thư mục này trên Git)
+
+# =========================
+# 3. PYTHON & ENVIRONMENTS
+# =========================
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.env
+.venv/
+env/
+venv/
+pip-log.txt
+pip-delete-this-directory.txt
+
+# =========================
+# 4. LOGS & CHECKPOINTS
+# =========================
 log/
+logs/
 Ripple-main/log/
+*.log
 
-
+# =========================
+# 5. IDE, OS & COMPILED
+# =========================
+.idea/
+.vscode/
 target/
 out/
 *.class
+.DS_Store
+Thumbs.db
 
-.idea/
-.vscode/
-
+# =========================
+# 6. ARCHIVES
+# =========================
 *.tar.gz
 *.zip
 *.rar

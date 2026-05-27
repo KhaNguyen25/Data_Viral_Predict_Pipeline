@@ -1,6 +1,7 @@
 from pyspark.sql import SparkSession
 from pyspark.sql.functions import (
-    col, count, sin, cos, pi, from_json, window, expr, approx_count_distinct, hour
+    col, count, sin, cos, pi, from_json, window, expr, approx_count_distinct, hour,
+    to_json, struct  # Thêm 2 hàm này để đóng gói dữ liệu cho Kafka
 )
 from pyspark.sql.types import StructType, StructField, StringType, LongType
 import os
@@ -13,61 +14,7 @@ BRONZE_LOGS_STORE = os.path.join(ROOT_DIR, "data", "bronze_logs")
 SILVER_FEATURE_STORE = os.path.join(ROOT_DIR, "data", "silver_features")
 CHECKPOINT_BRONZE = os.path.join(ROOT_DIR, "data", "checkpoints", "bronze")
 CHECKPOINT_SILVER = os.path.join(ROOT_DIR, "data", "checkpoints", "silver")
-MODEL_PATH = os.path.join(ROOT_DIR, "models", "xgboost_cache_model.json")
-
-_global_model = None
-_last_model_mod_time = 0
-
-def predict_and_save_partition(partition):
-    import xgboost as xgb
-    import redis
-    import pandas as pd
-    import os
-
-    records = list(partition)
-    if not records:
-        return
-
-    redis_client = redis.Redis(host='redis', port=6379, db=0, decode_responses=True)
-    
-    if not os.path.exists(MODEL_PATH):
-        return
-
-    # ==========================================================
-    # TỐI ƯU HÓA: SINGLETON MODEL LOADER
-    # Chỉ load lại model từ ổ cứng nếu file json có bản cập nhật mới
-    # ==========================================================
-    global _global_model, _last_model_mod_time
-    
-    current_mod_time = os.path.getmtime(MODEL_PATH) # Lấy thời gian file được sửa lần cuối
-    
-    # Lần chạy đầu tiên HOẶC khi Node AI vừa đẻ ra file model mới
-    if _global_model is None or current_mod_time > _last_model_mod_time:
-        print(f"🔄 Đang nạp Model XGBoost mới vào RAM (Timestamp: {current_mod_time})...")
-        _global_model = xgb.XGBClassifier()
-        _global_model.load_model(MODEL_PATH)
-        _last_model_mod_time = current_mod_time # Cập nhật lại mốc thời gian
-
-    # ==========================================================
-
-    df_pd = pd.DataFrame([r.asDict() for r in records])
-    
-    FEATURE_COLS = [
-        "hour_of_day", "hour_sin", "hour_cos", 
-        "active_edges_count", "req_count_current", 
-        "req_count_previous", "growth_rate"
-    ]
-    
-    X = df_pd[FEATURE_COLS]
-    
-    # Dùng model đã nạp sẵn trên RAM để dự đoán (Siêu tốc độ)
-    predictions = _global_model.predict(X)
-
-    # Đẩy lên Redis
-    for i, row in df_pd.iterrows():
-        if predictions[i] == 1:
-            object_id = row['curr_object_id'] 
-            redis_client.set(f"viral:{object_id}", "true", ex=3600)
+# Đã xóa MODEL_PATH và các biến global vì Spark không còn ôm đồm AI nữa
 
 def process_silver_micro_batch(df_batch, batch_id):
     """
@@ -127,8 +74,22 @@ def process_silver_micro_batch(df_batch, batch_id):
         .mode("append") \
         .save(SILVER_FEATURE_STORE)
 
-    # 5. ĐƯA XUỐNG WORKER ĐỂ INFERENCE
-    df_final.foreachPartition(predict_and_save_partition)
+    # ==============================================================
+    # 5. MÔ HÌNH 3: BẮN KẾT QUẢ (FEATURES) LÊN KAFKA
+    # ==============================================================
+    # Ép DataFrame thành 2 cột: 'key' (mã file) và 'value' (chuỗi JSON chứa toàn bộ dữ liệu)
+    df_kafka_out = df_final.selectExpr(
+        "curr_object_id AS key",
+        "to_json(struct(*)) AS value"
+    )
+    
+    # Ra lệnh cho Spark làm Producer bắn dữ liệu vào Topic mới
+    df_kafka_out.write \
+        .format("kafka") \
+        .option("kafka.bootstrap.servers", "kafka:9092") \
+        .option("topic", "cdn_features_stream") \
+        .save()
+    # ==============================================================
     
     # Giải phóng RAM
     df_final.unpersist()

@@ -27,46 +27,40 @@ services:
 
   # --- SPARK MASTER ---
   spark-master:
-      build: 
-        context: ./spark               # Chỉ định context build vào thư mục spark
-        dockerfile: Dockerfile.spark   
-      container_name: spark-master
-      networks:
-        - data-network
-      environment:
-        - SPARK_MODE=master
-        - SPARK_RPC_AUTHENTICATION_ENABLED=no
-        - SPARK_RPC_ENCRYPTION_ENABLED=no
-        - SPARK_LOCAL_STORAGE_ENCRYPTION_ENABLED=no
-        - SPARK_SSL_ENABLED=no
-      ports:
-        - "9090:8080"
-        - "7077:7077"
-      volumes:
-        - ./data:/app/data
-        - ./models:/app/models
-        - ./spark/code:/app/code
+    image: bitnamilegacy/spark:3.5.1     # Đã đổi từ build sang gọi thẳng image
+    container_name: spark-master
+    networks:
+      - data-network
+    environment:
+      - SPARK_MODE=master
+      - SPARK_RPC_AUTHENTICATION_ENABLED=no
+      - SPARK_RPC_ENCRYPTION_ENABLED=no
+      - SPARK_LOCAL_STORAGE_ENCRYPTION_ENABLED=no
+      - SPARK_SSL_ENABLED=no
+    ports:
+      - "9090:8080"
+      - "7077:7077"
+    volumes:
+      - ./data:/app/data
+      - ./spark/code:/app/code           # Đã gỡ bỏ volume models
 
   # --- SPARK WORKER ---
   spark-worker:
-      build: 
-        context: ./spark               # Chỉ định context build vào thư mục spark
-        dockerfile: Dockerfile.spark   
-      container_name: spark-worker
-      networks:
-        - data-network
-      environment:
-        - SPARK_MODE=worker
-        - SPARK_MASTER_URL=spark://spark-master:7077
-        - SPARK_WORKER_MEMORY=2G
-        - SPARK_WORKER_CORES=2
-        - SPARK_RPC_AUTHENTICATION_ENABLED=no
-      depends_on:
-        - spark-master
-      volumes:
-        - ./data:/app/data
-        - ./models:/app/models
-        - ./spark/code:/app/code
+    image: bitnamilegacy/spark:3.5.1     # Đã đổi từ build sang gọi thẳng image
+    container_name: spark-worker
+    networks:
+      - data-network
+    environment:
+      - SPARK_MODE=worker
+      - SPARK_MASTER_URL=spark://spark-master:7077
+      - SPARK_WORKER_MEMORY=2G
+      - SPARK_WORKER_CORES=2
+      - SPARK_RPC_AUTHENTICATION_ENABLED=no
+    depends_on:
+      - spark-master
+    volumes:
+      - ./data:/app/data
+      - ./spark/code:/app/code           # Đã gỡ bỏ volume models
 
   # --- REDIS (In-Memory Cache) ---
   redis:
@@ -76,23 +70,33 @@ services:
       - data-network
     ports:
       - "6379:6379"
-    volumes:
-      - ./redis_data:/data
-    command: redis-server --appendonly yes
+    # Ép Redis làm Smart Cache: Cấp 2GB RAM, ưu tiên xóa file hết hot, không lưu đĩa.
+    command: >
+      redis-server 
+      --maxmemory 2gb 
+      --maxmemory-policy volatile-lru 
+      --save "" 
+      --appendonly no
 
   # --- AI WORKSPACE (Nơi huấn luyện & Điều phối) ---
   ai-server:
-      build: ./ai-workspace
-      container_name: ai-env
-      networks:
-        - data-network
-      volumes:
-        - ./spark/code:/app/code       # TRỎ CHUẨN XÁC VÀO THƯ MỤC SPARK CỦA BẠN
-        - ./data:/app/data
-        - ./models:/app/models
-      environment:
-        - KAFKA_BROKER=kafka:9092
-        - SPARK_MASTER=spark://spark-master:7077
-      stdin_open: true 
-      tty: true
-      command: /bin/bash
+    build: ./ai-workspace
+    container_name: ai-env
+    networks:
+      - data-network
+    depends_on:                          # Bắt buộc chờ Kafka và Redis lên sóng trước
+      - kafka
+      - redis
+    volumes:
+      - ./ai-workspace:/app/ai-workspace
+      - ./spark/code:/app/code
+      - ./data:/app/data
+      - ./models:/app/models             # AI Server là nơi duy nhất giữ volume models
+    environment:
+      - KAFKA_BROKER=kafka:9092
+      - SPARK_MASTER=spark://spark-master:7077
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+    stdin_open: true 
+    tty: true
+    command: /bin/bash
