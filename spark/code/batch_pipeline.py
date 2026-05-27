@@ -1,26 +1,30 @@
 from pyspark.sql import SparkSession, Window
 from pyspark.sql.functions import col, lit, expr, max as spark_max
-import xgboost as xgb
-import pandas as pd
 import os
 import time
 
-# --- CẤU HÌNH ĐƯỜNG DẪN & THAM SỐ ---
-SILVER_FEATURE_STORE = "/app/data/silver_features/" 
-MODEL_PATH = "/app/models/xgboost_cache_model.json"
+# --- CẤU HÌNH ĐƯỜNG DẪN TỰ ĐỘNG ---
+CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
+ROOT_DIR = os.path.abspath(os.path.join(CURRENT_DIR, "../../"))
 
-# Cấu hình Cửa sổ Huấn luyện Trượt (Sliding Training Window)
+SILVER_FEATURE_STORE = os.path.join(ROOT_DIR, "data", "silver_features")
+GOLD_ML_DATASET = os.path.join(ROOT_DIR, "data", "gold_ml_dataset")
+
 LOOKBACK_DAYS = 1
-WINDOWS_PER_DAY = 24 * 4 # 1 giờ có 4 window (15 phút/window), 1 ngày có 96 windows
+WINDOWS_PER_DAY = 24 * 60 # 1 giờ có 60 window (1 phút/window), 1 ngày có 1440 windows
 
-def run_retraining_pipeline():
+# KHOẢNG CÁCH DỰ ĐOÁN (PREDICTION HORIZON)
+# Vì mỗi index = 1 phút. Dịch 15 index nghĩa là dạy model dự đoán 15 phút vào tương lai.
+PREDICT_AHEAD_MINUTES = 15 
+
+def run_labeling_pipeline():
     start_time = time.time()
     
     # ==========================================
     # 0. KHỞI TẠO SPARK VỚI DELTA LAKE
     # ==========================================
     spark = SparkSession.builder \
-        .appName("Retrain_Batch_Pipeline") \
+        .appName("Gold_Layer_Labeling_Pipeline") \
         .config("spark.driver.memory", "4g") \
         .config("spark.jars.packages", "io.delta:delta-spark_2.12:3.1.0") \
         .config("spark.sql.extensions", "io.delta.sql.DeltaSparkSessionExtension") \
@@ -30,51 +34,45 @@ def run_retraining_pipeline():
     spark.sparkContext.setLogLevel("WARN")
 
     # ==========================================
-    # 1. ĐỌC DỮ LIỆU TỪ SILVER LAYER (VỚI LOOKBACK WINDOW)
+    # 1. ĐỌC DỮ LIỆU TỪ SILVER LAYER
     # ==========================================
-    print(f"⏳ [1/4] Đọc dữ liệu Feature từ Delta Lake: {SILVER_FEATURE_STORE}...")
+    print(f"⏳ [1/4] Đọc dữ liệu Feature từ Delta Lake Silver: {SILVER_FEATURE_STORE}...")
     try:
         df_feat = spark.read.format("delta").load(SILVER_FEATURE_STORE)
     except Exception as e:
-        print(f"❌ Chưa có dữ liệu trong Delta Lake hoặc đường dẫn sai: {e}")
+        print(f"❌ Lỗi đọc Delta Lake: {e}")
         return
 
-    # 1A. Lấy window mới nhất hiện tại (Window đang chạy dở)
-    max_win = df_feat.select(spark_max("window_index")).collect()[0][0]
-    
-    # --- BỔ SUNG LỚP BẢO VỆ COLD START ---
-    if max_win is None:
-        print("⚠️ Bảng Silver Features hiện đang rỗng. Hủy Retrain.")
+    max_win_row_df = df_feat.select(spark_max("window_index")).collect()
+    max_win_row = max_win_row_df[0][0] if max_win_row_df else None
+
+    if max_win_row is None:
+        print("⚠️ Bảng Silver Features hiện đang rỗng. Hủy tiến trình.")
         return
         
-    # Đếm xem có bao nhiêu window riêng biệt đã hoàn thành
-    completed_windows_count = df_feat.filter(col("window_index") < max_win) \
+    completed_windows_count = df_feat.filter(col("window_index") < max_win_row) \
                                      .select("window_index").distinct().count()
-    if completed_windows_count < 2:
-        print("⚠️ Chưa có đủ ít nhất 2 Window (để so sánh quá khứ-tương lai). Hủy Retrain.")
+    
+    # Cần ít nhất khoảng thời gian lớn hơn PREDICT_AHEAD_MINUTES để có thể dịch nhãn
+    if completed_windows_count <= PREDICT_AHEAD_MINUTES:
+        print(f"⚠️ Chưa có đủ dữ liệu (cần > {PREDICT_AHEAD_MINUTES} Windows) để shift label. Hủy tiến trình.")
         return
     
-    # 1B. Tính toán điểm bắt đầu (Cắt bỏ dữ liệu quá cũ)
-    min_win = max_win - (LOOKBACK_DAYS * WINDOWS_PER_DAY)
+    min_win = max_win_row - (LOOKBACK_DAYS * WINDOWS_PER_DAY)
 
-    # 1C. Lọc dữ liệu: Chỉ lấy trong khoảng [min_win, max_win)
-    # Vừa cắt bỏ quá khứ (>= min_win), vừa cắt bỏ window dở dang hiện tại (< max_win)
     df_feat_filtered = df_feat.filter(
         (col("window_index") >= min_win) & 
-        (col("window_index") < max_win)
+        (col("window_index") < max_win_row)
     )
 
-    print(f"✅ Đã lọc dữ liệu của {LOOKBACK_DAYS} ngày gần nhất (Từ window {min_win} đến {max_win-1})")
-
     # ==========================================
-    # 2. TÍNH P95 VÀ GÁN NHÃN VIRAL (GLOBAL LEVEL)
+    # 2. TÍNH TOÁN NGƯỠNG P95 & GÁN NHÃN
     # ==========================================
     print("⏳ [2/4] Tính toán ngưỡng P95 và gán nhãn Hiện tại...")
     
-    # Lấy ngưỡng 75% toàn hệ thống làm sàn (để loại bỏ các object quá ít view)
+    # Tính sàn (Floor) để loại bỏ các file lèo tèo vài request
     global_floor = df_feat_filtered.approxQuantile("req_count_current", [0.75], 0.05)[0]
 
-    # Tính P95 cho từng Window bằng Window Function
     win_spec = Window.partitionBy("window_index")
     df_labeled = df_feat_filtered.withColumn(
         "p95_limit", expr("percentile_approx(req_count_current, 0.95)").over(win_spec)
@@ -84,63 +82,39 @@ def run_retraining_pipeline():
     ).drop("p95_limit")
 
     # ==========================================
-    # 3. DỊCH NHÃN TƯƠNG LAI (LABEL SHIFTING)
+    # 3. DỊCH NHÃN 15 PHÚT TƯƠNG LAI (LABEL SHIFTING)
     # ==========================================
-    print("⏳ [3/4] Dịch nhãn về tương lai (Để model học quá khứ -> đoán tương lai)...")
+    print(f"⏳ [3/4] Dịch nhãn về tương lai {PREDICT_AHEAD_MINUTES} phút...")
     
-    # Tạo một bảng nhãn tương lai bằng cách lùi window_index đi 1
+    # Bắt file của hiện tại lấy nhãn của 15 phút sau
     df_future = df_labeled.select(
-        (col("window_index") - 1).alias("fut_win"),
-        col("object_id").alias("fut_obj"),
+        (col("window_index") - PREDICT_AHEAD_MINUTES).alias("fut_win"),
+        col("curr_object_id").alias("fut_obj"),
         col("is_viral_now").alias("is_viral_next_window")
     )
 
-    # Join lại vào bảng chính
     df_final = df_labeled.join(df_future,
-        (col("window_index") == col("fut_win")) & (col("object_id") == col("fut_obj")),
+        (col("window_index") == col("fut_win")) & (col("curr_object_id") == col("fut_obj")),
         "left"
     ).fillna({"is_viral_next_window": 0}).drop("fut_win", "fut_obj", "is_viral_now")
 
-    # Bỏ window cuối cùng sau khi join (vì không có nhãn tương lai của nó)
-    max_win_final = df_final.select(spark_max("window_index")).collect()[0][0]
-    df_final = df_final.filter(col("window_index") < max_win_final)
+    # BƯỚC QUAN TRỌNG: Cắt bỏ 15 cửa sổ cuối cùng
+    # Vì 15 cửa sổ này chưa có dữ liệu tương lai để join, nếu không cắt sẽ bị fillna(0) làm nhiễu mô hình
+    safe_max_window = max_win_row - PREDICT_AHEAD_MINUTES
+    df_final = df_final.filter(col("window_index") < safe_max_window)
 
-    # ==========================================
-    # 4. HUẤN LUYỆN MODEL XGBOOST VÀ LƯU TRỮ
-    # ==========================================
-    print("⏳ [4/4] Tải dữ liệu về Pandas và Train XGBoost...")
-    
-    FEATURE_COLS = [
-        "hour_of_day", "hour_sin", "hour_cos", 
-        "active_edges_count", "req_count_current", 
-        "req_count_previous", "growth_rate"
-    ]
-    
-    # Collect data về Master Node để train ML
-    pd_train = df_final.select(FEATURE_COLS + ["is_viral_next_window"]).toPandas()
-
-    X = pd_train[FEATURE_COLS]
-    y = pd_train['is_viral_next_window']
-
-    model = xgb.XGBClassifier(
-        n_estimators=100, 
-        max_depth=6, 
-        learning_rate=0.1, 
-        use_label_encoder=False, 
-        eval_metric='logloss', 
-        n_jobs=-1
-    )
-    
-    model.fit(X, y)
-
-    # Lưu đè file .json (Worker trong Streaming sẽ tự động nạp lại ở lần dự đoán tiếp theo)
-    os.makedirs(os.path.dirname(MODEL_PATH), exist_ok=True)
-    model.save_model(MODEL_PATH)
+    # ==============================================================
+    # 4. GHI LỚP GOLD
+    # ==============================================================
+    print("⏳ [4/4] Ghi dữ liệu sạch đã gán nhãn xuống Lớp Gold...")
+    df_final.write \
+        .format("delta") \
+        .mode("overwrite") \
+        .save(GOLD_ML_DATASET)
 
     print("===================================================")
-    print(f"🎉 HOÀN TẤT RETRAIN MẤT: {round(time.time() - start_time, 2)} GIÂY.")
-    print(f"📁 Dữ liệu huấn luyện: {len(pd_train)} bản ghi (trong {LOOKBACK_DAYS} ngày).")
-    print(f"🧠 Model XGBoost cập nhật tại: {MODEL_PATH}")
+    print(f"🎉 HOÀN TẤT TẠO GOLD LAYER MẤT: {round(time.time() - start_time, 2)} GIÂY.")
+    print(f"🧠 Dữ liệu đã sẵn sàng tại: {GOLD_ML_DATASET}")
 
 if __name__ == "__main__":
-    run_retraining_pipeline()
+    run_labeling_pipeline()

@@ -1,41 +1,55 @@
 from pyspark.sql import SparkSession
 from pyspark.sql.functions import (
-    col, count, regexp_extract, when, 
-    sin, cos, pi, from_json, window, expr, approx_count_distinct, hour
+    col, count, sin, cos, pi, from_json, window, expr, approx_count_distinct, hour
 )
 from pyspark.sql.types import StructType, StructField, StringType, LongType
 import os
 
-# ==========================================
-# 1. HÀM XỬ LÝ TRÊN WORKER (EMBEDDED INFERENCE)
-# ==========================================
+# --- CẤU HÌNH ĐƯỜNG DẪN TỰ ĐỘNG ---
+CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
+ROOT_DIR = os.path.abspath(os.path.join(CURRENT_DIR, "../../"))
+
+BRONZE_LOGS_STORE = os.path.join(ROOT_DIR, "data", "bronze_logs")
+SILVER_FEATURE_STORE = os.path.join(ROOT_DIR, "data", "silver_features")
+CHECKPOINT_BRONZE = os.path.join(ROOT_DIR, "data", "checkpoints", "bronze")
+CHECKPOINT_SILVER = os.path.join(ROOT_DIR, "data", "checkpoints", "silver")
+MODEL_PATH = os.path.join(ROOT_DIR, "models", "xgboost_cache_model.json")
+
+_global_model = None
+_last_model_mod_time = 0
+
 def predict_and_save_partition(partition):
-    """
-    Hàm này sẽ được Spark bốc và ném xuống chạy trên từng con Worker.
-    Mỗi Worker sẽ tự load mô hình và tự ghi vào Redis.
-    """
     import xgboost as xgb
     import redis
     import pandas as pd
+    import os
 
-    # Chuyển dữ liệu phân mảnh (partition) thành danh sách
     records = list(partition)
     if not records:
         return
 
-    # Khởi tạo Redis Client (Trỏ tới container 'redis')
     redis_client = redis.Redis(host='redis', port=6379, db=0, decode_responses=True)
-
-    # Khởi tạo và Load mô hình AI trực tiếp vào RAM của Worker
-    model_path = "/app/models/xgboost_cache_model.json"
-    if not os.path.exists(model_path):
-        # Nếu chưa có model (chưa chạy Batch lần nào), tạm thời bỏ qua
+    
+    if not os.path.exists(MODEL_PATH):
         return
 
-    model = xgb.XGBClassifier()
-    model.load_model(model_path)
+    # ==========================================================
+    # TỐI ƯU HÓA: SINGLETON MODEL LOADER
+    # Chỉ load lại model từ ổ cứng nếu file json có bản cập nhật mới
+    # ==========================================================
+    global _global_model, _last_model_mod_time
+    
+    current_mod_time = os.path.getmtime(MODEL_PATH) # Lấy thời gian file được sửa lần cuối
+    
+    # Lần chạy đầu tiên HOẶC khi Node AI vừa đẻ ra file model mới
+    if _global_model is None or current_mod_time > _last_model_mod_time:
+        print(f"🔄 Đang nạp Model XGBoost mới vào RAM (Timestamp: {current_mod_time})...")
+        _global_model = xgb.XGBClassifier()
+        _global_model.load_model(MODEL_PATH)
+        _last_model_mod_time = current_mod_time # Cập nhật lại mốc thời gian
 
-    # Chuyển đổi dữ liệu sang Pandas để đưa vào XGBoost
+    # ==========================================================
+
     df_pd = pd.DataFrame([r.asDict() for r in records])
     
     FEATURE_COLS = [
@@ -46,38 +60,80 @@ def predict_and_save_partition(partition):
     
     X = df_pd[FEATURE_COLS]
     
-    # AI Dự đoán (Real-time)
-    predictions = model.predict(X)
+    # Dùng model đã nạp sẵn trên RAM để dự đoán (Siêu tốc độ)
+    predictions = _global_model.predict(X)
 
-    # Đẩy kết quả những file dự đoán là Viral (1) lên Redis
+    # Đẩy lên Redis
     for i, row in df_pd.iterrows():
         if predictions[i] == 1:
-            object_id = row['object_id']
-            # Cache sống trong 1 giờ (3600s)
+            object_id = row['curr_object_id'] 
             redis_client.set(f"viral:{object_id}", "true", ex=3600)
 
-# ==========================================
-# 2. HÀM ĐIỀU PHỐI TỪNG BATCH CỦA STREAMING
-# ==========================================
-def process_micro_batch(df_batch, batch_id):
+def process_silver_micro_batch(df_batch, batch_id):
     """
-    Hàm này chạy mỗi khi Spark gom đủ 1 phút dữ liệu.
+    Hàm này xử lý Stream-Static Join: Đóng băng Stream, nối với lịch sử trên Delta Lake.
     """
-    # BƯỚC A: Lưu kết quả đã gom nhóm (Silver Layer) xuống Delta Lake
-    # Để luồng Batch ban đêm dùng lại, không phải tính từ đầu!
-    df_batch.write \
+    spark = df_batch.sparkSession
+
+    # Lấy window_index nhỏ nhất trong micro-batch hiện tại
+    min_win_df = df_batch.select(expr("min(window_index)")).collect()
+    min_win_idx = min_win_df[0][0] if min_win_df else None
+
+    # Nếu micro-batch rỗng, bỏ qua
+    if min_win_idx is None:
+        return
+
+    # 1. ĐỌC DỮ LIỆU QUÁ KHỨ TỪ SILVER LAYER (TỐI ƯU HÓA ĐỌC)
+    try:
+        # CHỈ ĐỌC dữ liệu của 2 window gần nhất thay vì đọc toàn bộ bảng
+        df_history = spark.read.format("delta").load(SILVER_FEATURE_STORE) \
+            .filter(col("window_index") >= min_win_idx - 2)
+            
+        df_prev = df_history.select(
+            col("window_index").alias("prev_win_idx"),
+            col("curr_object_id").alias("prev_obj"),
+            col("req_count_current").alias("req_count_previous")
+        )
+    except Exception:
+        # Nếu chạy lần đầu tiên, thư mục Silver chưa tồn tại
+        empty_schema = StructType([
+            StructField("prev_win_idx", LongType(), True),
+            StructField("prev_obj", StringType(), True),
+            StructField("req_count_previous", LongType(), True)
+        ])
+        df_prev = spark.createDataFrame([], empty_schema)
+
+    # 2. TẠO CỘT TARGET ĐỂ JOIN LÙI VỀ 1 WINDOW
+    df_curr = df_batch.withColumn("target_prev_idx", col("window_index") - 1)
+
+    # 3. THỰC HIỆN STATIC JOIN VÀ TÍNH GROWTH RATE
+    df_joined = df_curr.join(
+        df_prev,
+        (col("target_prev_idx") == col("prev_win_idx")) & (col("curr_object_id") == col("prev_obj")),
+        "leftOuter"
+    ).fillna({"req_count_previous": 0})
+
+    df_final = df_joined.withColumn(
+        "growth_rate", 
+        (col("req_count_current") - col("req_count_previous")) / (col("req_count_previous") + 1)
+    ).drop("target_prev_idx", "prev_win_idx", "prev_obj")
+
+    # Cache lại df_final vào RAM để tối ưu
+    df_final.persist()
+
+    # 4. GHI DỮ LIỆU FEATURE HOÀN CHỈNH XUỐNG SILVER LAYER
+    df_final.write \
         .format("delta") \
         .mode("append") \
-        .save("/app/data/silver_features/")
+        .save(SILVER_FEATURE_STORE)
 
-    # BƯỚC B: Phân phát dữ liệu xuống các Worker để AI dự đoán
-    df_batch.foreachPartition(predict_and_save_partition)
+    # 5. ĐƯA XUỐNG WORKER ĐỂ INFERENCE
+    df_final.foreachPartition(predict_and_save_partition)
+    
+    # Giải phóng RAM
+    df_final.unpersist()
 
-# ==========================================
-# 3. PIPELINE XỬ LÝ CHÍNH
-# ==========================================
-def load_process_data_streaming(spark: SparkSession):
-    # (Đoạn code bạn viết được giữ nguyên 100%)
+def start_streaming_pipeline(spark: SparkSession):
     json_schema = StructType([
         StructField("timestamp_rel", LongType(), True), 
         StructField("timestamp_abs", LongType(), True), 
@@ -93,33 +149,42 @@ def load_process_data_streaming(spark: SparkSession):
         .option("startingOffsets", "latest") \
         .load()
 
-    df_base = kafka_df.filter(col("value").isNotNull()).select(
+    # 1. PARSE DỮ LIỆU THÔ
+    df_parsed = kafka_df.filter(col("value").isNotNull()).select(
         from_json(col("value").cast("string"), json_schema).alias("data")
     ).select(
         (col("data.timestamp_abs") / 1000).cast("timestamp").alias("timestamp"), 
         col("data.key").alias("object_id"),
         col("data.node_id").alias("node_id"),
         col("data.operation").alias("operation") 
-    ).filter(col("operation") == "get")
+    )
 
-    # WATERMARK 1 MINUTE
-    df_agg = df_base \
+    # ==============================================================
+    # LUỒNG 1: GHI BRONZE LAYER (Lưu toàn bộ Raw Log)
+    # ==============================================================
+    query_bronze = df_parsed.writeStream \
+        .format("delta") \
+        .outputMode("append") \
+        .option("checkpointLocation", CHECKPOINT_BRONZE) \
+        .trigger(processingTime="1 minute") \
+        .start(BRONZE_LOGS_STORE)
+
+    # ==============================================================
+    # LUỒNG 2: TÍNH TOÁN CƠ BẢN VÀ ĐẨY VÀO FOREACHBATCH
+    # ==============================================================
+    df_get_requests = df_parsed.filter(col("operation") == "get")
+
+    df_agg = df_get_requests \
         .withWatermark("timestamp", "1 minutes") \
         .groupBy(
-            window(col("timestamp"), "15 minutes").alias("time_window"),
+            window(col("timestamp"), "15 minutes", "1 minute").alias("time_window"),
             col("object_id"),
         ).agg(
             count("*").alias("req_count_current"),
             approx_count_distinct(col("node_id")).alias("active_edges_count") 
         )
     
-    regex_pattern = "^([a-zA-Z0-9]+)[^a-zA-Z0-9]"
-    df_agg = df_agg.withColumn(
-        "namespace",
-        when(col("object_id").rlike(regex_pattern), regexp_extract(col("object_id"), regex_pattern, 1))
-        .otherwise("unknown")
-    )
-
+    # Chỉ tính các đặc trưng tĩnh ở luồng Stream (Giờ, chu kỳ)
     df_features = df_agg.withColumn(
         "hour_of_day", hour(col("time_window.start"))
     ).withColumn(
@@ -128,44 +193,26 @@ def load_process_data_streaming(spark: SparkSession):
         "hour_cos", cos(2 * pi() * col("hour_of_day") / 24)
     )
 
-    df_curr = df_features.alias("curr")
-    
-    df_prev = df_features.select(
-        col("time_window.end").alias("prev_window_end"), 
-        col("object_id").alias("prev_obj_id"),
-        col("req_count_current").alias("req_count_previous")
-    ).alias("prev")
-
-    join_conditions = [
-        col("curr.object_id") == col("prev.prev_obj_id"),
-        col("curr.time_window.start") == col("prev.prev_window_end"),
-        expr("curr.time_window.start >= prev.prev_window_end"),
-        expr("curr.time_window.start <= prev.prev_window_end + interval 15 minutes")
-    ]
-
-    df_joined = df_curr.join(df_prev, join_conditions, "leftOuter") \
-        .fillna({"req_count_previous": 0})
-
-    df_final = df_joined.withColumn(
-        "growth_rate", 
-        (col("req_count_current") - col("req_count_previous")) / (col("req_count_previous") + 1)
-    )
-
-    df_output = df_final.select(
-        (col("curr.time_window.start").cast("long") / 900).cast("long").alias("window_index"),
+    # Cấu trúc đầu ra siêu gọn (CHÚ Ý: window_index được chia cho 60)
+    df_output = df_features.select(
+        (col("time_window.start").cast("long") / 60).cast("long").alias("window_index"),
         "hour_of_day", "hour_sin", "hour_cos",
-        "curr.object_id", "curr.namespace",
+        col("object_id").alias("curr_object_id"), 
         "active_edges_count",
-        "req_count_current", "req_count_previous", "growth_rate"
+        "req_count_current"
     )
 
-    return df_output
+    # Đẩy toàn bộ dataframe tĩnh này vào hàm process_silver_micro_batch
+    query_silver = df_output.writeStream \
+        .outputMode("append") \
+        .foreachBatch(process_silver_micro_batch) \
+        .trigger(processingTime="1 minute") \
+        .option("checkpointLocation", CHECKPOINT_SILVER) \
+        .start()
 
-# ==========================================
-# 4. KHỞI TẠO VÀ CHẠY ỨNG DỤNG
-# ==========================================
+    spark.streams.awaitAnyTermination()
+
 if __name__ == "__main__":
-    # Nhúng cấu hình Delta Lake vào luồng Streaming
     spark = SparkSession.builder \
         .appName("CDN_Realtime_Cache_Predictor") \
         .config("spark.jars.packages", "io.delta:delta-spark_2.12:3.1.0,org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.0") \
@@ -173,18 +220,6 @@ if __name__ == "__main__":
         .config("spark.sql.catalog.spark_catalog", "org.apache.spark.sql.delta.catalog.DeltaCatalog") \
         .getOrCreate()
         
-    # Giảm mức độ log để dễ nhìn console
     spark.sparkContext.setLogLevel("WARN")
-
-    print("🚀 Đang kích hoạt luồng Real-time...")
-    final_df = load_process_data_streaming(spark)
-
-    # Đẩy ra Output Sink
-    query = final_df.writeStream \
-        .outputMode("append") \
-        .foreachBatch(process_micro_batch) \
-        .trigger(processingTime="1 minute") \
-        .option("checkpointLocation", "/app/data/checkpoints/realtime_pipeline/") \
-        .start()
-
-    query.awaitTermination()
+    print("🚀 Đang kích hoạt luồng Real-time (Bronze + Silver với Stream-Static Join)...")
+    start_streaming_pipeline(spark)
