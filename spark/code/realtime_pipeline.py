@@ -3,7 +3,7 @@ from pyspark.sql.functions import (
     col, count, sin, cos, pi, from_json, window, expr, approx_count_distinct, hour,
     to_json, struct  # Thêm 2 hàm này để đóng gói dữ liệu cho Kafka
 )
-from pyspark.sql.types import StructType, StructField, StringType, LongType
+from pyspark.sql.types import StructType, StructField, StringType, LongType, IntegerType
 import os
 
 # --- CẤU HÌNH ĐƯỜNG DẪN TỰ ĐỘNG ---
@@ -45,7 +45,8 @@ def process_silver_micro_batch(df_batch, batch_id):
         # Nếu chạy lần đầu tiên, thư mục Silver chưa tồn tại
         empty_schema = StructType([
             StructField("prev_win_idx", LongType(), True),
-            StructField("prev_obj", StringType(), True),
+            # ĐỔI StringType() SANG IntegerType()
+            StructField("prev_obj", IntegerType(), True), 
             StructField("req_count_previous", LongType(), True)
         ])
         df_prev = spark.createDataFrame([], empty_schema)
@@ -98,7 +99,8 @@ def start_streaming_pipeline(spark: SparkSession):
     json_schema = StructType([
         StructField("timestamp_rel", LongType(), True), 
         StructField("timestamp_abs", LongType(), True), 
-        StructField("key", StringType(), True), 
+        # ĐỔI StringType() SANG IntegerType()
+        StructField("key", IntegerType(), True), 
         StructField("node_id", StringType(), True), 
         StructField("operation", StringType(), True) 
     ])
