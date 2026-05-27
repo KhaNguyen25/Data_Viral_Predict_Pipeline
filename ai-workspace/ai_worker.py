@@ -85,9 +85,9 @@ def start_ai_worker():
 
             # 3.4. Bắn Cache lên Redis nếu có tín hiệu Viral
             if prediction == 1:
-                # set key với TTL = 3600 giây (1 tiếng)
-                redis_client.set(f"viral:{obj_id}", "true", ex=3600)
-                print(f"🔥 [BÁO ĐỘNG] File {obj_id} sắp Viral! Đã đẩy lệnh Cache (TTL: 1h).")
+                # set key với TTL = 1800 giây (30 phút)
+                redis_client.set(f"viral:{obj_id}", "TRUE", ex=1800)
+                print(f"🔥 [BÁO ĐỘNG] File {obj_id} sắp Viral! Đã đẩy lệnh Cache (TTL: 30p).")
                 
     except KeyboardInterrupt:
         print("\n🛑 Nhận lệnh dừng. Đang đóng kết nối an toàn...")
