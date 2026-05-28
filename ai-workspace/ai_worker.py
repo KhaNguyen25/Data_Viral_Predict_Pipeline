@@ -13,7 +13,6 @@ KAFKA_TOPIC = 'cdn_features_stream'
 REDIS_HOST = 'redis'
 REDIS_PORT = 6379
 
-# [SỬA LẠI KHÚC NÀY] Lùi 1 cấp giống hệt ai_retrain.py
 CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
 ROOT_DIR = os.path.abspath(os.path.join(CURRENT_DIR, "../"))
 MODEL_PATH = os.path.join(ROOT_DIR, "models", "xgboost_cache_model.json")
@@ -26,7 +25,7 @@ FEATURE_COLS = [
 ]
 
 def start_ai_worker():
-    print("🚀 Đang khởi động AI Worker...")
+    print("🚀 Đang khởi động AI Worker (Chế độ tối ưu Micro-batching)...")
 
     # ==========================================
     # 2. KHỞI TẠO (CHỈ CHẠY 1 LẦN DUY NHẤT)
@@ -51,44 +50,64 @@ def start_ai_worker():
         return
 
     # 2.3. Kết nối Kafka Consumer
-    # value_deserializer giúp tự động dịch chuỗi Byte của Kafka thành Dictionary (JSON) của Python
     consumer = KafkaConsumer(
         KAFKA_TOPIC,
         bootstrap_servers=[KAFKA_BROKER],
-        auto_offset_reset='latest', # Bỏ qua data cũ lúc tắt máy, chỉ lấy luồng live
+        auto_offset_reset='latest', 
         enable_auto_commit=True,
         value_deserializer=lambda m: json.loads(m.decode('utf-8'))
     )
     print(f"🎧 AI Worker đang lắng nghe trực tiếp luồng dữ liệu từ topic: '{KAFKA_TOPIC}'...\n")
 
     # ==========================================
-    # 3. VÒNG LẶP SỰ KIỆN (EVENT LOOP)
+    # 3. VÒNG LẶP SỰ KIỆN (EVENT LOOP) - XỬ LÝ HÀNG LOẠT
     # ==========================================
     try:
-        # Vòng lặp này tự động "ngủ" khi không có tin nhắn, không làm hao CPU
-        for message in consumer:
-            data = message.value
+        while True:
+            # Lấy tối đa 500 tin nhắn một lúc. Chờ tối đa 1 giây (1000ms).
+            # Nếu Spark chưa xả batch hoặc ít traffic, Worker sẽ tự động ngủ trong 1s này
+            msg_pack = consumer.poll(timeout_ms=1000, max_records=500)
             
-            # 3.1. Tách ID ra khỏi cục Data (Vì ID không được đưa vào dự đoán)
-            # Dùng .pop() lấy value ra và xóa key đó khỏi dictionary
-            obj_id = data.pop('curr_object_id', None) 
-            
-            if not obj_id:
+            if not msg_pack:
                 continue
-
-            # 3.2. Ép cục Data còn lại thành Pandas DataFrame với 1 dòng duy nhất
-            # Chú ý: Ta truyền cột FEATURE_COLS để ép Pandas xếp đúng thứ tự cột cho XGBoost
-            df_features = pd.DataFrame([data], columns=FEATURE_COLS)
             
-            # 3.3. AI Dự đoán (Siêu tốc)
-            prediction = model.predict(df_features)[0]
+            batch_data = []
+            batch_obj_ids = []
+            
+            # Duyệt qua các phân vùng (partitions) và tin nhắn (messages) trong lô vừa bốc được
+            for tp, messages in msg_pack.items():
+                for message in messages:
+                    data = message.value
+                    
+                    # Tách ID ra khỏi dữ liệu
+                    obj_id = data.pop('curr_object_id', None) 
+                    
+                    if obj_id is not None:
+                        batch_data.append(data)
+                        batch_obj_ids.append(obj_id)
 
-            # 3.4. Bắn Cache lên Redis nếu có tín hiệu Viral
-            if prediction == 1:
-                # set key với TTL = 1800 giây (30 phút)
-                redis_client.set(f"viral:{obj_id}", "TRUE", ex=1800)
-                print(f"🔥 [BÁO ĐỘNG] File {obj_id} sắp Viral! Đã đẩy lệnh Cache (TTL: 30p).")
+            # Bắt đầu xử lý nếu lô dữ liệu có chứa thông tin
+            if batch_data:
+                # 3.1. Gom tất cả thành 1 DataFrame duy nhất (chuẩn hóa thứ tự cột)
+                df_features = pd.DataFrame(batch_data, columns=FEATURE_COLS)
                 
+                # 3.2. AI Dự đoán HÀNG LOẠT (Nhanh hơn hàng trăm lần so với chạy for từng dòng)
+                predictions = model.predict(df_features)
+
+                # 3.3. Sử dụng Redis Pipeline để gom lệnh ghi
+                pipeline = redis_client.pipeline()
+                viral_count = 0
+                
+                for obj_id, pred in zip(batch_obj_ids, predictions):
+                    if pred == 1:
+                        pipeline.set(f"viral:{obj_id}", "TRUE", ex=1800) # TTL: 30 phút
+                        viral_count += 1
+                
+                # 3.4. Bắn toàn bộ lệnh lên Redis trong 1 lần duy nhất để tiết kiệm kết nối mạng
+                if viral_count > 0:
+                    pipeline.execute()
+                    print(f"🔥 [BÁO ĐỘNG] Đã nhận lô {len(batch_data)} logs -> Phát hiện {viral_count} file sắp Viral! Đã ghi Cache.")
+                    
     except KeyboardInterrupt:
         print("\n🛑 Nhận lệnh dừng. Đang đóng kết nối an toàn...")
     finally:
