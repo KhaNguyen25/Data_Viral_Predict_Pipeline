@@ -31,7 +31,7 @@ def start_ai_worker():
     # 2. KHỞI TẠO (CHỈ CHẠY 1 LẦN DUY NHẤT)
     # ==========================================
     
-    # 2.1. Nạp Model vào RAM
+    # 2.1. Nạp Model vào RAM lần đầu
     if not os.path.exists(MODEL_PATH):
         print(f"❌ Lỗi: Không tìm thấy model tại {MODEL_PATH}. Vui lòng chạy Batch Pipeline để train model trước!")
         return
@@ -39,6 +39,9 @@ def start_ai_worker():
     model = xgb.XGBClassifier()
     model.load_model(MODEL_PATH)
     print("✅ Đã nạp thành công XGBoost Model vào RAM.")
+    
+    # Lưu lại thời điểm file model được tạo/sửa lần cuối
+    last_model_mtime = os.path.getmtime(MODEL_PATH)
 
     # 2.2. Kết nối Redis
     try:
@@ -64,6 +67,22 @@ def start_ai_worker():
     # ==========================================
     try:
         while True:
+            # ---------------------------------------------------------
+            # BƯỚC MỚI: KIỂM TRA VÀ CẬP NHẬT MODEL TỰ ĐỘNG (HOT-RELOAD)
+            # ---------------------------------------------------------
+            try:
+                current_mtime = os.path.getmtime(MODEL_PATH)
+                if current_mtime > last_model_mtime:
+                    print("\n🔄 [HOT-RELOAD] Phát hiện Model XGBoost mới từ quá trình Retrain!")
+                    print("⏳ Đang nạp lại Model vào RAM...")
+                    model.load_model(MODEL_PATH)
+                    last_model_mtime = current_mtime
+                    print("✅ Đã cập nhật Model mới thành công. Tiếp tục dự đoán...\n")
+            except OSError:
+                # Bỏ qua lỗi trong khoảnh khắc file model đang bị ghi đè (xóa và tạo mới)
+                pass
+            # ---------------------------------------------------------
+
             # Lấy tối đa 500 tin nhắn một lúc. Chờ tối đa 1 giây (1000ms).
             # Nếu Spark chưa xả batch hoặc ít traffic, Worker sẽ tự động ngủ trong 1s này
             msg_pack = consumer.poll(timeout_ms=1000, max_records=500)

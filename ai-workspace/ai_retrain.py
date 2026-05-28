@@ -3,8 +3,8 @@ import pandas as pd
 import xgboost as xgb
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score
-import glob
 import time
+from deltalake import DeltaTable # Thay thế glob bằng thư viện đọc Delta Lake chuẩn
 
 # ==========================================
 # 1. CẤU HÌNH ĐƯỜNG DẪN
@@ -12,7 +12,7 @@ import time
 CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
 ROOT_DIR = os.path.abspath(os.path.join(CURRENT_DIR, "../"))
 
-# Trỏ thẳng vào thư mục chứa file Parquet của lớp Gold (Delta Lake bản chất là Parquet)
+# Trỏ thẳng vào thư mục chứa file Parquet của lớp Gold (Delta Lake)
 GOLD_ML_DATASET_PATH = os.path.join(ROOT_DIR, "data", "gold_ml_dataset")
 MODEL_SAVE_PATH = os.path.join(ROOT_DIR, "models", "xgboost_cache_model.json")
 
@@ -32,23 +32,26 @@ def train_and_save_model():
     print("🚀 [1/4] Bắt đầu tiến trình Retrain AI Model...")
 
     # ==========================================
-    # 2. ĐỌC DỮ LIỆU TỪ LỚP GOLD (DELTA/PARQUET)
+    # 2. ĐỌC DỮ LIỆU TỪ LỚP GOLD BẰNG DELTA LAKE ENGINE
     # ==========================================
-    # Delta Lake lưu dữ liệu thành nhiều file .parquet nhỏ trong thư mục
-    # Ta dùng glob để tìm tất cả các file này
-    parquet_files = glob.glob(os.path.join(GOLD_ML_DATASET_PATH, "*.parquet"))
+    print(f"⏳ [2/4] Đang nạp bảng Delta Table từ: {GOLD_ML_DATASET_PATH}...")
     
-    if not parquet_files:
-        print(f"❌ Lỗi: Không tìm thấy file dữ liệu nào tại {GOLD_ML_DATASET_PATH}. Bạn đã chạy Batch Pipeline chưa?")
+    try:
+        # Load bảng Delta. Thư viện này tự động đọc _delta_log và 
+        # chỉ lấy những file thuộc về transaction snapshot mới nhất
+        dt = DeltaTable(GOLD_ML_DATASET_PATH)
+        
+        # Ép kiểu thẳng sang Pandas DataFrame
+        df = dt.to_pandas()
+    except Exception as e:
+        print(f"❌ Lỗi: Không thể đọc Delta Table. Bạn đã chạy Batch Pipeline chưa? Chi tiết lỗi: {e}")
+        return
+    
+    if df.empty:
+        print("❌ Lỗi: Bảng Delta Table trống. Không có dữ liệu để huấn luyện.")
         return
 
-    print(f"⏳ [2/4] Đang nạp {len(parquet_files)} file dữ liệu vào RAM...")
-    
-    # Nối tất cả các file thành 1 bảng Pandas duy nhất
-    df_list = [pd.read_parquet(file) for file in parquet_files]
-    df = pd.concat(df_list, ignore_index=True)
-    
-    print(f"✅ Tổng số dòng dữ liệu huấn luyện: {len(df)}")
+    print(f"✅ Tổng số dòng dữ liệu thực tế (sau khi loại bỏ rác từ _delta_log): {len(df)}")
 
     # Loại bỏ các dòng có giá trị NaN (đề phòng có lỗi trong lúc join)
     df = df.dropna(subset=FEATURE_COLS + [TARGET_COL])
@@ -72,8 +75,8 @@ def train_and_save_model():
     # ==========================================
     print("⏳ [3/4] Đang huấn luyện (Train) mô hình XGBoost...")
     
-    # Cấu hình siêu tham số (Hyperparameters) - Có thể tuning thêm sau này
-    # scale_pos_weight: Rất quan trọng vì số lượng file KHÔNG viral luôn nhiều gấp vạn lần file Viral (Imbalanced Data)
+    # Cấu hình siêu tham số (Hyperparameters)
+    # scale_pos_weight: Rất quan trọng vì số lượng file KHÔNG viral luôn nhiều gấp vạn lần
     viral_ratio = len(y_train[y_train == 0]) / max(len(y_train[y_train == 1]), 1)
     
     model = xgb.XGBClassifier(
@@ -110,13 +113,9 @@ def train_and_save_model():
     print(f"🎯 Điểm tổng hợp (F1-Score)     : {f1:.4f}")
     print("--------------------------\n")
 
-    # Chỉ ghi đè model mới nếu nó đủ tốt (Tránh việc data hôm nay quá rác làm model bị ngu đi)
-    # Ví dụ: Mình quy định F1-score phải >= 0.5 mới được lưu
+    # Chỉ ghi đè model mới nếu nó đủ tốt
     if f1 >= 0.5:
-        # Xóa file cũ (nếu có) để tránh xung đột
-        if os.path.exists(MODEL_SAVE_PATH):
-            os.remove(MODEL_SAVE_PATH)
-            
+        
         model.save_model(MODEL_SAVE_PATH)
         print(f"🎉 ĐÃ LƯU MODEL MỚI TẠI: {MODEL_SAVE_PATH}")
     else:
