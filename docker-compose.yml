@@ -25,9 +25,11 @@ services:
     ports:
       - "9092:9092"
 
-  # --- SPARK MASTER ---
+# --- SPARK MASTER ---
   spark-master:
-    image: bitnamilegacy/spark:3.5.1     # Đã đổi từ build sang gọi thẳng image
+    build:
+      context: .
+      dockerfile: Dockerfile.spark
     container_name: spark-master
     networks:
       - data-network
@@ -46,7 +48,9 @@ services:
 
   # --- SPARK WORKER ---
   spark-worker:
-    image: bitnamilegacy/spark:3.5.1     # Đã đổi từ build sang gọi thẳng image
+    build:
+      context: .
+      dockerfile: Dockerfile.spark
     container_name: spark-worker
     networks:
       - data-network
@@ -60,7 +64,7 @@ services:
       - spark-master
     volumes:
       - ./data:/app/data
-      - ./spark/code:/app/code           # Đã gỡ bỏ volume models
+      - ./spark/code:/app/code
 
   # --- REDIS (In-Memory Cache) ---
   redis:

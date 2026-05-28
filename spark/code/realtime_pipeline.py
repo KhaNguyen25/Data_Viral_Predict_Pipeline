@@ -5,6 +5,7 @@ from pyspark.sql.functions import (
 )
 from pyspark.sql.types import StructType, StructField, StringType, LongType, IntegerType
 import os
+from delta.tables import DeltaTable
 
 # --- CẤU HÌNH ĐƯỜNG DẪN TỰ ĐỘNG ---
 CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -69,11 +70,23 @@ def process_silver_micro_batch(df_batch, batch_id):
     # Cache lại df_final vào RAM để tối ưu
     df_final.persist()
 
-    # 4. GHI DỮ LIỆU FEATURE HOÀN CHỈNH XUỐNG SILVER LAYER
-    df_final.write \
-        .format("delta") \
-        .mode("append") \
-        .save(SILVER_FEATURE_STORE)
+    # 4. GHI DỮ LIỆU FEATURE HOÀN CHỈNH XUỐNG SILVER LAYER (SỬA LỖI TRÙNG LẶP MERGE/UPSERT)
+    if DeltaTable.isDeltaTable(spark, SILVER_FEATURE_STORE):
+        deltaTable = DeltaTable.forPath(spark, SILVER_FEATURE_STORE)
+        
+        # Upsert (Merge) để chống ghi trùng dữ liệu khi Spark chạy lại micro-batch lỗi
+        deltaTable.alias("target").merge(
+            df_final.alias("source"),
+            "target.window_index = source.window_index AND target.curr_object_id = source.curr_object_id"
+        ).whenMatchedUpdateAll() \
+         .whenNotMatchedInsertAll() \
+         .execute()
+    else:
+        # Lần chạy đầu tiên (chưa có bảng Delta), tiến hành ghi append bình thường
+        df_final.write \
+            .format("delta") \
+            .mode("append") \
+            .save(SILVER_FEATURE_STORE)
 
     # ==============================================================
     # 5. MÔ HÌNH 3: BẮN KẾT QUẢ (FEATURES) LÊN KAFKA

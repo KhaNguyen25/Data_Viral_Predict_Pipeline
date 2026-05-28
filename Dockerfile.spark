@@ -1,0 +1,10 @@
+FROM bitnami/spark:3.5.0
+
+# Chuyển qua quyền root để cài đặt package Python
+USER root
+
+# Cài đặt delta-spark khớp tuyệt đối với version JAR 3.1.0 mà bạn khai báo trong code
+RUN pip install --no-cache-dir delta-spark==3.1.0
+
+# Trả lại quyền user mặc định (1001) của bitnami để đảm bảo bảo mật
+USER 1001

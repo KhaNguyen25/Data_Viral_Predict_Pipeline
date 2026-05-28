@@ -32,7 +32,6 @@ def start_ai_worker():
     # 2. KHỞI TẠO (CHỈ CHẠY 1 LẦN DUY NHẤT)
     # ==========================================
     
-    # 2.1. Nạp Model vào RAM lần đầu
     if not os.path.exists(MODEL_PATH):
         print(f"❌ Lỗi: Không tìm thấy model tại {MODEL_PATH}. Vui lòng chạy Batch Pipeline để train model trước!")
         return
@@ -41,10 +40,8 @@ def start_ai_worker():
     model.load_model(MODEL_PATH)
     print("✅ Đã nạp thành công XGBoost Model vào RAM.")
     
-    # Lưu lại thời điểm file model được tạo/sửa lần cuối
     last_model_mtime = os.path.getmtime(MODEL_PATH)
 
-    # 2.2. Kết nối Redis
     try:
         redis_client = redis.Redis(host=REDIS_HOST, port=REDIS_PORT, db=0, decode_responses=True)
         redis_client.ping()
@@ -53,12 +50,12 @@ def start_ai_worker():
         print(f"❌ Lỗi kết nối Redis: {e}")
         return
 
-    # 2.3. Kết nối Kafka Consumer
+    # [SỬA LỖI 2]: Tắt auto-commit để chuyển sang chế độ commit thủ công (At-least-once)
     consumer = KafkaConsumer(
         KAFKA_TOPIC,
         bootstrap_servers=[KAFKA_BROKER],
         auto_offset_reset='latest', 
-        enable_auto_commit=True,
+        enable_auto_commit=False, 
         value_deserializer=lambda m: json.loads(m.decode('utf-8'))
     )
     print(f"🎧 AI Worker đang lắng nghe trực tiếp luồng dữ liệu từ topic: '{KAFKA_TOPIC}'...\n")
@@ -68,7 +65,6 @@ def start_ai_worker():
     # ==========================================
     try:
         while True:
-            # BỌC TRY...EXCEPT BÊN TRONG ĐỂ CHỐNG CRASH CHO TỪNG BATCH
             try:
                 # ---------------------------------------------------------
                 # BƯỚC 3.1: KIỂM TRA VÀ CẬP NHẬT MODEL TỰ ĐỘNG (HOT-RELOAD)
@@ -78,15 +74,19 @@ def start_ai_worker():
                     if current_mtime > last_model_mtime:
                         print("\n🔄 [HOT-RELOAD] Phát hiện Model XGBoost mới từ quá trình Retrain!")
                         print("⏳ Đang nạp lại Model vào RAM...")
-                        model.load_model(MODEL_PATH)
-                        last_model_mtime = current_mtime
-                        print("✅ Đã cập nhật Model mới thành công. Tiếp tục dự đoán...\n")
+                        
+                        # [SỬA LỖI 1]: Bọc Exception tại bước load_model để tránh crash khi file model đang ghi dở
+                        try:
+                            model.load_model(MODEL_PATH)
+                            last_model_mtime = current_mtime
+                            print("✅ Đã cập nhật Model mới thành công. Tiếp tục dự đoán...\n")
+                        except Exception as load_err:
+                            print(f"⚠️ Chưa thể nạp model mới (có thể file đang bị ghi): {load_err}")
+                            
                 except OSError:
-                    # Bỏ qua lỗi trong khoảnh khắc file model đang bị ghi đè
                     pass
                 # ---------------------------------------------------------
 
-                # Lấy tối đa 500 tin nhắn một lúc. Chờ tối đa 1 giây (1000ms).
                 msg_pack = consumer.poll(timeout_ms=1000, max_records=500)
                 
                 if not msg_pack:
@@ -95,45 +95,37 @@ def start_ai_worker():
                 batch_data = []
                 batch_obj_ids = []
                 
-                # Duyệt qua các phân vùng (partitions) và tin nhắn (messages) trong lô
                 for tp, messages in msg_pack.items():
                     for message in messages:
                         data = message.value
-                        
-                        # Tách ID ra khỏi dữ liệu
                         obj_id = data.pop('curr_object_id', None) 
-                        
                         if obj_id is not None:
                             batch_data.append(data)
                             batch_obj_ids.append(obj_id)
 
-                # Bắt đầu xử lý nếu lô dữ liệu có chứa thông tin
                 if batch_data:
-                    # Gom tất cả thành 1 DataFrame duy nhất
                     df_features = pd.DataFrame(batch_data, columns=FEATURE_COLS)
-                    
-                    # AI Dự đoán HÀNG LOẠT
                     predictions = model.predict(df_features)
 
-                    # Sử dụng Redis Pipeline để gom lệnh ghi
                     pipeline = redis_client.pipeline()
                     viral_count = 0
                     
                     for obj_id, pred in zip(batch_obj_ids, predictions):
                         if pred == 1:
-                            pipeline.set(f"viral:{obj_id}", "TRUE", ex=1800) # TTL: 30 phút
+                            pipeline.set(f"viral:{obj_id}", "TRUE", ex=1800)
                             viral_count += 1
                     
-                    # Bắn toàn bộ lệnh lên Redis trong 1 lần duy nhất
                     if viral_count > 0:
                         pipeline.execute()
                         print(f"🔥 [BÁO ĐỘNG] Đã nhận lô {len(batch_data)} logs -> Phát hiện {viral_count} file sắp Viral! Đã ghi Cache.")
-                        
+                
+                # [SỬA LỖI 2]: Commit offset thủ công sau khi đảm bảo batch đã được xử lý và ghi Redis an toàn
+                consumer.commit()
+
             except Exception as batch_error:
-                # Bắt mọi lỗi xảy ra trong batch (lỗi mạng, lỗi dữ liệu rác, đứt kết nối Redis...)
                 print(f"⚠️ [CẢNH BÁO CỤC BỘ] Lỗi trong lúc xử lý batch hiện tại: {batch_error}")
-                print("➡️ Hệ thống sẽ bỏ qua batch này và tự động thử lại ở batch tiếp theo sau 2 giây...")
-                time.sleep(2)  # Nghỉ 2 giây để tránh spam log liên tục nếu lỗi là do đứt mạng/sập Redis
+                print("➡️ Do chưa commit offset, hệ thống sẽ tự động thử lại toàn bộ batch này ở vòng lặp sau...")
+                time.sleep(2) 
                 
     except KeyboardInterrupt:
         print("\n🛑 Nhận lệnh dừng. Đang đóng kết nối an toàn...")
