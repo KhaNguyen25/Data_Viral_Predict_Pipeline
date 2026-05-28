@@ -103,4 +103,4 @@ services:
       - REDIS_PORT=6379
     stdin_open: true 
     tty: true
-    command: /bin/bash
+    command: python /app/ai-workspace/ai_worker.py
