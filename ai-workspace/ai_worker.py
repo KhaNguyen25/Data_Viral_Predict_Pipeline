@@ -3,6 +3,7 @@ import os
 import xgboost as xgb
 import redis
 import pandas as pd
+import time  # Thêm thư viện time để xử lý delay khi gặp lỗi
 from kafka import KafkaConsumer
 
 # ==========================================
@@ -67,66 +68,73 @@ def start_ai_worker():
     # ==========================================
     try:
         while True:
-            # ---------------------------------------------------------
-            # BƯỚC MỚI: KIỂM TRA VÀ CẬP NHẬT MODEL TỰ ĐỘNG (HOT-RELOAD)
-            # ---------------------------------------------------------
+            # BỌC TRY...EXCEPT BÊN TRONG ĐỂ CHỐNG CRASH CHO TỪNG BATCH
             try:
-                current_mtime = os.path.getmtime(MODEL_PATH)
-                if current_mtime > last_model_mtime:
-                    print("\n🔄 [HOT-RELOAD] Phát hiện Model XGBoost mới từ quá trình Retrain!")
-                    print("⏳ Đang nạp lại Model vào RAM...")
-                    model.load_model(MODEL_PATH)
-                    last_model_mtime = current_mtime
-                    print("✅ Đã cập nhật Model mới thành công. Tiếp tục dự đoán...\n")
-            except OSError:
-                # Bỏ qua lỗi trong khoảnh khắc file model đang bị ghi đè (xóa và tạo mới)
-                pass
-            # ---------------------------------------------------------
+                # ---------------------------------------------------------
+                # BƯỚC 3.1: KIỂM TRA VÀ CẬP NHẬT MODEL TỰ ĐỘNG (HOT-RELOAD)
+                # ---------------------------------------------------------
+                try:
+                    current_mtime = os.path.getmtime(MODEL_PATH)
+                    if current_mtime > last_model_mtime:
+                        print("\n🔄 [HOT-RELOAD] Phát hiện Model XGBoost mới từ quá trình Retrain!")
+                        print("⏳ Đang nạp lại Model vào RAM...")
+                        model.load_model(MODEL_PATH)
+                        last_model_mtime = current_mtime
+                        print("✅ Đã cập nhật Model mới thành công. Tiếp tục dự đoán...\n")
+                except OSError:
+                    # Bỏ qua lỗi trong khoảnh khắc file model đang bị ghi đè
+                    pass
+                # ---------------------------------------------------------
 
-            # Lấy tối đa 500 tin nhắn một lúc. Chờ tối đa 1 giây (1000ms).
-            # Nếu Spark chưa xả batch hoặc ít traffic, Worker sẽ tự động ngủ trong 1s này
-            msg_pack = consumer.poll(timeout_ms=1000, max_records=500)
-            
-            if not msg_pack:
-                continue
-            
-            batch_data = []
-            batch_obj_ids = []
-            
-            # Duyệt qua các phân vùng (partitions) và tin nhắn (messages) trong lô vừa bốc được
-            for tp, messages in msg_pack.items():
-                for message in messages:
-                    data = message.value
-                    
-                    # Tách ID ra khỏi dữ liệu
-                    obj_id = data.pop('curr_object_id', None) 
-                    
-                    if obj_id is not None:
-                        batch_data.append(data)
-                        batch_obj_ids.append(obj_id)
+                # Lấy tối đa 500 tin nhắn một lúc. Chờ tối đa 1 giây (1000ms).
+                msg_pack = consumer.poll(timeout_ms=1000, max_records=500)
+                
+                if not msg_pack:
+                    continue
+                
+                batch_data = []
+                batch_obj_ids = []
+                
+                # Duyệt qua các phân vùng (partitions) và tin nhắn (messages) trong lô
+                for tp, messages in msg_pack.items():
+                    for message in messages:
+                        data = message.value
+                        
+                        # Tách ID ra khỏi dữ liệu
+                        obj_id = data.pop('curr_object_id', None) 
+                        
+                        if obj_id is not None:
+                            batch_data.append(data)
+                            batch_obj_ids.append(obj_id)
 
-            # Bắt đầu xử lý nếu lô dữ liệu có chứa thông tin
-            if batch_data:
-                # 3.1. Gom tất cả thành 1 DataFrame duy nhất (chuẩn hóa thứ tự cột)
-                df_features = pd.DataFrame(batch_data, columns=FEATURE_COLS)
-                
-                # 3.2. AI Dự đoán HÀNG LOẠT (Nhanh hơn hàng trăm lần so với chạy for từng dòng)
-                predictions = model.predict(df_features)
-
-                # 3.3. Sử dụng Redis Pipeline để gom lệnh ghi
-                pipeline = redis_client.pipeline()
-                viral_count = 0
-                
-                for obj_id, pred in zip(batch_obj_ids, predictions):
-                    if pred == 1:
-                        pipeline.set(f"viral:{obj_id}", "TRUE", ex=1800) # TTL: 30 phút
-                        viral_count += 1
-                
-                # 3.4. Bắn toàn bộ lệnh lên Redis trong 1 lần duy nhất để tiết kiệm kết nối mạng
-                if viral_count > 0:
-                    pipeline.execute()
-                    print(f"🔥 [BÁO ĐỘNG] Đã nhận lô {len(batch_data)} logs -> Phát hiện {viral_count} file sắp Viral! Đã ghi Cache.")
+                # Bắt đầu xử lý nếu lô dữ liệu có chứa thông tin
+                if batch_data:
+                    # Gom tất cả thành 1 DataFrame duy nhất
+                    df_features = pd.DataFrame(batch_data, columns=FEATURE_COLS)
                     
+                    # AI Dự đoán HÀNG LOẠT
+                    predictions = model.predict(df_features)
+
+                    # Sử dụng Redis Pipeline để gom lệnh ghi
+                    pipeline = redis_client.pipeline()
+                    viral_count = 0
+                    
+                    for obj_id, pred in zip(batch_obj_ids, predictions):
+                        if pred == 1:
+                            pipeline.set(f"viral:{obj_id}", "TRUE", ex=1800) # TTL: 30 phút
+                            viral_count += 1
+                    
+                    # Bắn toàn bộ lệnh lên Redis trong 1 lần duy nhất
+                    if viral_count > 0:
+                        pipeline.execute()
+                        print(f"🔥 [BÁO ĐỘNG] Đã nhận lô {len(batch_data)} logs -> Phát hiện {viral_count} file sắp Viral! Đã ghi Cache.")
+                        
+            except Exception as batch_error:
+                # Bắt mọi lỗi xảy ra trong batch (lỗi mạng, lỗi dữ liệu rác, đứt kết nối Redis...)
+                print(f"⚠️ [CẢNH BÁO CỤC BỘ] Lỗi trong lúc xử lý batch hiện tại: {batch_error}")
+                print("➡️ Hệ thống sẽ bỏ qua batch này và tự động thử lại ở batch tiếp theo sau 2 giây...")
+                time.sleep(2)  # Nghỉ 2 giây để tránh spam log liên tục nếu lỗi là do đứt mạng/sập Redis
+                
     except KeyboardInterrupt:
         print("\n🛑 Nhận lệnh dừng. Đang đóng kết nối an toàn...")
     finally:
