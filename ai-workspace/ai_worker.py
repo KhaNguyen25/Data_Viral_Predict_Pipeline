@@ -9,7 +9,7 @@ from kafka import KafkaConsumer
 # ==========================================
 # 1. CẤU HÌNH HỆ THỐNG VÀ ĐƯỜNG DẪN
 # ==========================================
-KAFKA_BROKER = 'kafka:9092'
+KAFKA_BROKER = 'kafka:29092'
 KAFKA_TOPIC = 'cdn_features_stream'
 REDIS_HOST = 'redis'
 REDIS_PORT = 6379
