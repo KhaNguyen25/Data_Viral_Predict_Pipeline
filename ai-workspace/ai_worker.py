@@ -112,7 +112,7 @@ def start_ai_worker():
                     
                     for obj_id, pred in zip(batch_obj_ids, predictions):
                         if pred == 1:
-                            pipeline.set(f"viral:{obj_id}", "TRUE", ex=1800)
+                            pipeline.set(f"viral:{obj_id}", "TRUE", ex=900)
                             viral_count += 1
                     
                     if viral_count > 0:

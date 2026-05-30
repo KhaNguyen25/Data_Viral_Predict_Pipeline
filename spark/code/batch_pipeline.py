@@ -11,11 +11,11 @@ SILVER_FEATURE_STORE = os.path.join(ROOT_DIR, "data", "silver_features")
 GOLD_ML_DATASET = os.path.join(ROOT_DIR, "data", "gold_ml_dataset")
 
 LOOKBACK_DAYS = 1
-WINDOWS_PER_DAY = 24 * 60 # 1 giờ có 60 window (1 phút/window), 1 ngày có 1440 windows
+WINDOWS_PER_DAY = int(24 * 60 / 5) # 1 giờ có 12 window (5 phút/window), 1 ngày có 288 windows
 
 # KHOẢNG CÁCH DỰ ĐOÁN (PREDICTION HORIZON)
 # Vì mỗi index = 1 phút. Dịch 15 index nghĩa là dạy model dự đoán 15 phút vào tương lai.
-PREDICT_AHEAD_MINUTES = 15 
+PREDICT_AHEAD_WINDOWS = 3 # Trượt 3 index tương đương với 15 phút tương lai (3 x 5 = 15) 
 
 def run_labeling_pipeline():
     start_time = time.time()
@@ -53,9 +53,9 @@ def run_labeling_pipeline():
     completed_windows_count = df_feat.filter(col("window_index") < max_win_row) \
                                      .select("window_index").distinct().count()
     
-    # Cần ít nhất khoảng thời gian lớn hơn PREDICT_AHEAD_MINUTES để có thể dịch nhãn
-    if completed_windows_count <= PREDICT_AHEAD_MINUTES:
-        print(f"⚠️ Chưa có đủ dữ liệu (cần > {PREDICT_AHEAD_MINUTES} Windows) để shift label. Hủy tiến trình.")
+    # Cần ít nhất khoảng thời gian lớn hơn PREDICT_AHEAD_WINDOWS để có thể dịch nhãn
+    if completed_windows_count <= PREDICT_AHEAD_WINDOWS:
+        print(f"⚠️ Chưa có đủ dữ liệu (cần > {PREDICT_AHEAD_WINDOWS} Windows) để shift label. Hủy tiến trình.")
         return
     
     min_win = max_win_row - (LOOKBACK_DAYS * WINDOWS_PER_DAY)
@@ -84,11 +84,11 @@ def run_labeling_pipeline():
     # ==========================================
     # 3. DỊCH NHÃN 15 PHÚT TƯƠNG LAI (LABEL SHIFTING)
     # ==========================================
-    print(f"⏳ [3/4] Dịch nhãn về tương lai {PREDICT_AHEAD_MINUTES} phút...")
+    print(f"⏳ [3/4] Dịch nhãn về tương lai {PREDICT_AHEAD_WINDOWS} cửa sổ...")
     
     # Bắt file của hiện tại lấy nhãn của 15 phút sau
     df_future = df_labeled.select(
-        (col("window_index") - PREDICT_AHEAD_MINUTES).alias("fut_win"),
+        (col("window_index") - PREDICT_AHEAD_WINDOWS).alias("fut_win"),
         col("curr_object_id").alias("fut_obj"),
         col("is_viral_now").alias("is_viral_next_window")
     )
@@ -100,7 +100,7 @@ def run_labeling_pipeline():
 
     # BƯỚC QUAN TRỌNG: Cắt bỏ 15 cửa sổ cuối cùng
     # Vì 15 cửa sổ này chưa có dữ liệu tương lai để join, nếu không cắt sẽ bị fillna(0) làm nhiễu mô hình
-    safe_max_window = max_win_row - PREDICT_AHEAD_MINUTES
+    safe_max_window = max_win_row - PREDICT_AHEAD_WINDOWS
     df_final = df_final.filter(col("window_index") < safe_max_window)
 
     # ==============================================================
