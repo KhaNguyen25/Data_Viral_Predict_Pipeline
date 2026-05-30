@@ -4,7 +4,7 @@ from kafka.errors import TopicAlreadyExistsError
 def create_log_topic():
     print("Khởi tạo Admin Client kết nối tới Kafka...")
     admin_client = KafkaAdminClient(
-        bootstrap_servers="kafka:9092",  # Đồng bộ gọi tên mạng Docker
+        bootstrap_servers="kafka:29092",  # Đồng bộ gọi tên mạng Docker
         client_id='edge_node_setup'
     )
 

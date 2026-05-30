@@ -4,7 +4,7 @@ from kafka.errors import TopicAlreadyExistsError
 def create_kafka_topic():
     print("Khởi tạo Admin Client kết nối tới Kafka...")
     admin_client = KafkaAdminClient(
-        bootstrap_servers="kafka:9092", 
+        bootstrap_servers="kafka:29092", 
         client_id='cdn_admin_setup'
     )
 

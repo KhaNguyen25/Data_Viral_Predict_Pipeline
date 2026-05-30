@@ -100,7 +100,7 @@ def process_silver_micro_batch(df_batch, batch_id):
     # Ra lệnh cho Spark làm Producer bắn dữ liệu vào Topic mới
     df_kafka_out.write \
         .format("kafka") \
-        .option("kafka.bootstrap.servers", "kafka:9092") \
+        .option("kafka.bootstrap.servers", "kafka:29092") \
         .option("topic", "cdn_features_stream") \
         .save()
     # ==============================================================
@@ -120,7 +120,7 @@ def start_streaming_pipeline(spark: SparkSession):
 
     kafka_df = spark.readStream \
         .format("kafka") \
-        .option("kafka.bootstrap.servers", "kafka:9092") \
+        .option("kafka.bootstrap.servers", "kafka:29092") \
         .option("subscribe", "edge_node_req_logs") \
         .option("startingOffsets", "latest") \
         .load()
