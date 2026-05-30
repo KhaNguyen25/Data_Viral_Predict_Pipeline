@@ -54,6 +54,7 @@ def start_ai_worker():
     consumer = KafkaConsumer(
         KAFKA_TOPIC,
         bootstrap_servers=[KAFKA_BROKER],
+        group_id='ai_cache_predictor_group',
         auto_offset_reset='latest', 
         enable_auto_commit=False, 
         value_deserializer=lambda m: json.loads(m.decode('utf-8'))

@@ -93,7 +93,7 @@ def process_silver_micro_batch(df_batch, batch_id):
     # ==============================================================
     # Ép DataFrame thành 2 cột: 'key' (mã file) và 'value' (chuỗi JSON chứa toàn bộ dữ liệu)
     df_kafka_out = df_final.selectExpr(
-        "curr_object_id AS key",
+        "CAST(curr_object_id AS STRING) AS key",
         "to_json(struct(*)) AS value"
     )
     
@@ -180,7 +180,7 @@ def start_streaming_pipeline(spark: SparkSession):
 
     # Đẩy toàn bộ dataframe tĩnh này vào hàm process_silver_micro_batch
     query_silver = df_output.writeStream \
-        .outputMode("append") \
+        .outputMode("update") \
         .foreachBatch(process_silver_micro_batch) \
         .trigger(processingTime="5 minutes") \
         .option("checkpointLocation", CHECKPOINT_SILVER) \
