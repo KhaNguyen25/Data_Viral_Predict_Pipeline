@@ -11,11 +11,11 @@ SILVER_FEATURE_STORE = os.path.join(ROOT_DIR, "data", "silver_features")
 GOLD_ML_DATASET = os.path.join(ROOT_DIR, "data", "gold_ml_dataset")
 
 LOOKBACK_DAYS = 1
-WINDOWS_PER_DAY = int(24 * 60 / 5) # 1 giờ có 12 window (5 phút/window), 1 ngày có 288 windows
+WINDOWS_PER_DAY = int(24 * 60 / 15) # 1 ngày có 96 windows (15 phút/window)
 
 # KHOẢNG CÁCH DỰ ĐOÁN (PREDICTION HORIZON)
 # Vì mỗi index = 1 phút. Dịch 15 index nghĩa là dạy model dự đoán 15 phút vào tương lai.
-PREDICT_AHEAD_WINDOWS = 3 # Trượt 3 index tương đương với 15 phút tương lai (3 x 5 = 15) 
+PREDICT_AHEAD_WINDOWS = 1 # Trượt 1 index tương đương với 15 phút tương lai (1 x 15 = 15) 
 
 def run_labeling_pipeline():
     start_time = time.time()

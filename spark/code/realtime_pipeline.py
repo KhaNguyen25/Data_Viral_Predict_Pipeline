@@ -142,7 +142,7 @@ def start_streaming_pipeline(spark: SparkSession):
         .format("delta") \
         .outputMode("append") \
         .option("checkpointLocation", CHECKPOINT_BRONZE) \
-        .trigger(processingTime="5 minutes") \
+        .trigger(processingTime="15 minutes") \
         .start(BRONZE_LOGS_STORE)
 
     # ==============================================================
@@ -151,9 +151,9 @@ def start_streaming_pipeline(spark: SparkSession):
     df_get_requests = df_parsed.filter(col("operation") == "get")
 
     df_agg = df_get_requests \
-        .withWatermark("timestamp", "5 minutes") \
+        .withWatermark("timestamp", "15 minutes") \
         .groupBy(
-            window(col("timestamp"), "15 minutes", "5 minutes").alias("time_window"),
+            window(col("timestamp"), "15 minutes").alias("time_window"), # Chỉ truyền 1 tham số
             col("object_id"),
         ).agg(
             count("*").alias("req_count_current"),
@@ -169,9 +169,9 @@ def start_streaming_pipeline(spark: SparkSession):
         "hour_cos", cos(2 * pi() * col("hour_of_day") / 24)
     )
 
-    # Cấu trúc đầu ra siêu gọn (CHÚ Ý: window_index được chia cho 300)
+    # Cấu trúc đầu ra siêu gọn
     df_output = df_features.select(
-        (col("time_window.start").cast("long") / 300).cast("long").alias("window_index"),
+        (col("time_window.start").cast("long") / 900).cast("long").alias("window_index"), # Đổi 300 thành 900
         "hour_of_day", "hour_sin", "hour_cos",
         col("object_id").alias("curr_object_id"), 
         "active_edges_count",
@@ -182,7 +182,7 @@ def start_streaming_pipeline(spark: SparkSession):
     query_silver = df_output.writeStream \
         .outputMode("update") \
         .foreachBatch(process_silver_micro_batch) \
-        .trigger(processingTime="5 minutes") \
+        .trigger(processingTime="15 minutes") \
         .option("checkpointLocation", CHECKPOINT_SILVER) \
         .start()
 
