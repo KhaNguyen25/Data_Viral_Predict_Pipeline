@@ -47,7 +47,7 @@ def process_silver_micro_batch(df_batch, batch_id):
         empty_schema = StructType([
             StructField("prev_win_idx", LongType(), True),
             # ĐỔI StringType() SANG IntegerType()
-            StructField("prev_obj", IntegerType(), True), 
+            StructField("prev_obj", LongType(), True), 
             StructField("req_count_previous", LongType(), True)
         ])
         df_prev = spark.createDataFrame([], empty_schema)
@@ -113,7 +113,7 @@ def start_streaming_pipeline(spark: SparkSession):
         StructField("timestamp_rel", LongType(), True), 
         StructField("timestamp_abs", LongType(), True), 
         # ĐỔI StringType() SANG IntegerType()
-        StructField("key", IntegerType(), True), 
+        StructField("key", LongType(), True), 
         StructField("node_id", StringType(), True), 
         StructField("operation", StringType(), True) 
     ])
