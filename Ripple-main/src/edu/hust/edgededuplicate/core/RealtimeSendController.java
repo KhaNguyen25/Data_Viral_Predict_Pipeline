@@ -25,10 +25,20 @@ public class RealtimeSendController {
     private long simStartWallClockMs = -1;
     private static final java.util.logging.Logger logger =
             edu.hust.edgededuplicate.utill.GlobalLogger.getLogger();
-    private final RateLimiter rateLimiter = RateLimiter.create(21000);
+
 
     private final int maxTestLines;
     private final int dedupBatchSize;
+    private final int maxGetRequests;
+
+    private final RateLimiter rateLimiter;
+    private final int testDurationMinutes;
+    private final long testDurationMs;
+
+
+
+
+
 
     public RealtimeSendController(Map<Integer, EdgeServer> serversMap, int totalNodes, int[][] distancesMatrix) {
         this.serversMap = serversMap;
@@ -41,67 +51,26 @@ public class RealtimeSendController {
 
         this.maxTestLines = ConfigurationManager.getIntProperty("maxTestLines");
         this.dedupBatchSize = ConfigurationManager.getIntProperty("dedupBatchSize");
+
+
+        double logRatePerSecond = ConfigurationManager.getDoubleProperty("logRatePerSecond");
+        this.rateLimiter = RateLimiter.create(logRatePerSecond);
+
+        this.testDurationMinutes = ConfigurationManager.getIntProperty("testDurationMinutes");
+        this.testDurationMs = this.testDurationMinutes * 60L * 1000L;
+        this.maxGetRequests = ConfigurationManager.getIntProperty("maxGetRequests");
+
     }
 
-//    public void startStreaming(String filePath) {
-//
-//        System.out.println("Bắt đầu nạp dữ liệu từ file log: " + filePath);
-//        this.simStartWallClockMs = System.currentTimeMillis();
-//        try (BufferedReader br = new BufferedReader(
-//                new InputStreamReader(new GZIPInputStream(new FileInputStream(filePath))))) {
-//            String line;
-//            int lineNumber = 0;
-//
-//
-//            long startMs = System.currentTimeMillis();
-//            while ((line = br.readLine()) != null) {
-//                lineNumber++;
-//
-//                if (line.trim().isEmpty()) {
-//                    continue;
-//                }
-//
-//                // Nếu dòng đầu là header thật, bỏ qua.
-//                // Ví dụ: uid timestamp lon lat videoId
-//                if (lineNumber == 1 && !Character.isDigit(line.trim().charAt(0))) {
-//                    continue;
-//                }
-//
-//                processLine(line, lineNumber);
-//                if (lineNumber % 10_000 == 0) {
-//                    long elapsedMs = System.currentTimeMillis() - startMs;
-//                    double seconds = elapsedMs / 1000.0;
-//                    double linesPerSecond = lineNumber / seconds;
-//
-//                    System.out.println(
-//                            "[SPEED] line=" + lineNumber +
-//                                    ", elapsed=" + String.format("%.2f", seconds) + "s" +
-//                                    ", speed=" + String.format("%.2f", linesPerSecond) + " lines/s"
-//                    );
-//                }
-//                if (lineNumber >= 300000) {
-//                    System.out.println("Đã chạy đủ 100000 dòng test, dừng streaming.");
-//                    break;
-//                }
-//
-//            }
-//
-//            System.out.println("Đã nạp xong toàn bộ file log!");
-//
-//        } catch (Exception e) {
-//            e.printStackTrace();
-//        }
-//        finally {
-//            kafkaProducer.close();
-//        }
-//    }
 
     public void startStreaming(String filePath) {
 
         System.out.println("Bắt đầu nạp dữ liệu từ file log: " + filePath);
         this.simStartWallClockMs = System.currentTimeMillis();
 
-        boolean stoppedByLimit = false;
+        boolean stoppedByLineLimit = false;
+        boolean stoppedByTimeLimit = false;
+
         long startMs = System.currentTimeMillis();
 
         try (BufferedReader br = new BufferedReader(
@@ -109,8 +78,10 @@ public class RealtimeSendController {
 
             String line;
             int lineNumber = 0;
+            int getRequestCount = 0;
 
             boolean alreadyDedupAtThisLine = false;
+
             while ((line = br.readLine()) != null) {
                 lineNumber++;
 
@@ -122,43 +93,100 @@ public class RealtimeSendController {
                     continue;
                 }
 
-                processLine(line, lineNumber);
+                boolean isGetRequest = processLine(line, lineNumber);
+
+                if (isGetRequest) {
+                    getRequestCount++;
+                }
+
+                long elapsedMs = System.currentTimeMillis() - startMs;
+
+                // Cứ mỗi dedupBatchSize GET request, lấy mẫu mức sử dụng cache.
+                // Mẫu này dùng để tính Avg Storage Utilization trong MetricCollector.
+                if (isGetRequest && dedupBatchSize > 0 && getRequestCount % this.dedupBatchSize == 0) {
+                    MetricCollector.sampleStorage(serversMap);
+                }
 
                 alreadyDedupAtThisLine = false;
 
-                if (dedupBatchSize > 0 && lineNumber % dedupBatchSize == 0) {
-                    runBatchDedup(lineNumber);
+                if (isGetRequest && dedupBatchSize > 0 && getRequestCount % dedupBatchSize == 0) {
+                    runBatchDedup(getRequestCount);
                     alreadyDedupAtThisLine = true;
                 }
 
                 if (lineNumber % 10_000 == 0) {
-                    long elapsedMs = System.currentTimeMillis() - startMs;
                     double seconds = elapsedMs / 1000.0;
+                    double minutes = seconds / 60.0;
                     double speed = lineNumber / Math.max(seconds, 0.001);
 
                     System.out.println(
                             "[SPEED] line=" + lineNumber +
+                                    ", getRequests=" + getRequestCount +
                                     ", elapsed=" + String.format("%.2f", seconds) + "s" +
+                                    ", elapsedMin=" + String.format("%.2f", minutes) +
                                     ", speed=" + String.format("%.2f", speed) + " lines/s"
                     );
                 }
 
+                // Dừng theo thời gian chạy, ví dụ 30 phút
+                if (testDurationMs > 0 && elapsedMs >= testDurationMs) {
+                    System.out.println(
+                            "[STOP] Đã chạy đủ " + testDurationMinutes +
+                                    " phút, dừng streaming theo thời gian."
+                    );
+                    stoppedByTimeLimit = true;
+                    break;
+                }
+//                Dừng theo maxrequest>0
+                if (maxGetRequests > 0 && getRequestCount >= maxGetRequests) {
+                    System.out.println(
+                            "[STOP] Đã chạy đủ " + maxGetRequests +
+                                    " request GET hợp lệ, dừng streaming."
+                    );
+                    stoppedByLineLimit = true;
+                    break;
+                }
+
+                // Dừng theo số dòng nếu maxTestLines > 0
+                // Nếu maxTestLines = 0 thì bỏ qua điều kiện này
                 if (maxTestLines > 0 && lineNumber >= maxTestLines) {
-                    System.out.println("Đã chạy đủ " + maxTestLines + " dòng test, dừng streaming.");
-                    stoppedByLimit = true;
+                    System.out.println(
+                            "[STOP] Đã chạy đủ " + maxTestLines +
+                                    " dòng test, dừng streaming theo số dòng."
+                    );
+                    stoppedByLineLimit = true;
                     break;
                 }
             }
 
             // Chạy dedup thêm một lần cuối sau khi dừng batch
             if (!alreadyDedupAtThisLine) {
-                runBatchDedup(lineNumber);
+                runBatchDedup(getRequestCount);
             }
 
-            if (stoppedByLimit) {
-                System.out.println("Đã dừng theo giới hạn test, chưa nạp hết toàn bộ file log.");
+            long totalElapsedMs = System.currentTimeMillis() - startMs;
+            double totalSeconds = totalElapsedMs / 1000.0;
+            double totalMinutes = totalSeconds / 60.0;
+            double avgSpeed = lineNumber / Math.max(totalSeconds, 0.001);
+
+
+
+            System.out.println(
+                    "[SUMMARY] processedLines=" + lineNumber +
+                            ", getRequests=" + getRequestCount +
+                            ", elapsed=" + String.format("%.2f", totalSeconds) + "s" +
+                            ", elapsedMin=" + String.format("%.2f", totalMinutes) +
+                            ", avgSpeed=" + String.format("%.2f", avgSpeed) + " lines/s" +
+                            ", stoppedByTimeLimit=" + stoppedByTimeLimit +
+                            ", stoppedByLineLimit=" + stoppedByLineLimit
+            );
+
+            if (stoppedByTimeLimit) {
+                System.out.println("Đã dừng theo giới hạn thời gian, chưa nạp hết toàn bộ file log.");
+            } else if (stoppedByLineLimit) {
+                System.out.println("Đã dừng theo giới hạn số dòng test, chưa nạp hết toàn bộ file log.");
             } else {
-                System.out.println("Đã nạp xong toàn bộ file log!");
+                System.out.println("Đã nạp xong toàn bộ file log trước khi đạt giới hạn thời gian.");
             }
 
         } catch (Exception e) {
@@ -219,108 +247,244 @@ public class RealtimeSendController {
         );
     }
 
-    private void processLine(String line, int lineNumber) {
-        rateLimiter.acquire();
-        // Dùng được cả log cách nhau bằng khoảng trắng hoặc dấu phẩy
-        String[] columns = line.trim().split("[,\\s]+");
-
-        if (columns.length < 6) {
-            System.err.println("[Log " + lineNumber + "] Bỏ qua vì không đủ cột: " + line);
-            return;
-        }
-
-        try {
-            /*
-             * Theo mô tả của bạn:
-             * - Cột thứ 5, index 4, là giá trị dùng để chia dư cho 30.
-             * - Giá trị đó cũng nên được dùng làm videoId/dataHash trong Ripple.
-             */
-            long timestampRel = System.currentTimeMillis();
-
-            String videoId = columns[1];
-            long dataHash = convertVideoIdToLong(videoId);
-
-            long nodeNumber = Long.parseLong(columns[4]);
-            int nodeId = (int) Math.floorMod(nodeNumber, totalNodes);
-
-
-            String operation = columns[5];
-
-
-
-//            waitUntilLogTime(timestampRel);
-
-            EdgeServer targetServer = serversMap.get(nodeId);
-
-            if (targetServer == null) {
-                System.err.println("[Log " + lineNumber + "] Không tìm thấy node " + nodeId);
-                return;
-            }
-
-            boolean existedBefore = targetServer.searchLocalData(dataHash);
-            boolean inserted = false;
-
-//            if (!existedBefore && targetServer.getStorageUtilization() >= this.storageUpperLimit) {
-//                int sizeBefore = targetServer.dataTable.size();
-//                double storageBefore = targetServer.getStorageUtilization();
+//    private void processLine(String line, int lineNumber) {
 //
-//                System.out.println(
-//                        "[DEDUP-BEFORE-INSERT] NODE_" + (nodeId+1) +
-//                                " storage=" + String.format("%.4f", storageBefore) +
-//                                " >= " + this.storageUpperLimit +
-//                                ", start deduplicate..."
-//                );
+//        MetricCollector.currentLineNumber = lineNumber;
+//        rateLimiter.acquire();
+//        // Dùng được cả log cách nhau bằng khoảng trắng hoặc dấu phẩy
+//        String[] columns = line.trim().split("[,\\s]+");
 //
-//                targetServer.deduplicate(this.distancesMatrix, serversMap, new HashMap<>());
+//        if (columns.length < 6) {
+//            System.err.println("[Log " + lineNumber + "] Bỏ qua vì không đủ cột: " + line);
+//            return;
+//        }
 //
-//                int sizeAfter = targetServer.dataTable.size();
-//                double storageAfter = targetServer.getStorageUtilization();
-//                int deleted = sizeBefore - sizeAfter;
+//        try {
+//            /*
+//             * Theo mô tả của bạn:
+//             * - Cột thứ 5, index 4, là giá trị dùng để chia dư cho 30.
+//             * - Giá trị đó cũng nên được dùng làm videoId/dataHash trong Ripple.
+//             */
+//            long timestampRel = System.currentTimeMillis();
 //
-//                System.out.println(
-//                        "[DEDUP-DONE] NODE_" + (nodeId+1) +
-//                                " size before=" + sizeBefore +
-//                                ", after=" + sizeAfter +
-//                                ", deleted=" + deleted +
-//                                ", storage before=" + String.format("%.6f", storageBefore) +
-//                                ", after=" + String.format("%.6f", storageAfter)
-//                );
+//            String videoId = columns[1].trim();
+//            long dataHash = convertVideoIdToLong(videoId);
+//
+//            long nodeNumber = Long.parseLong(columns[4].trim());
+//            int nodeId = (int) Math.floorMod(nodeNumber, totalNodes);
+//
+//
+////            String operation = columns[5];
+//            String operation = columns[5].trim().toLowerCase();
+//
+//
+//
+////            waitUntilLogTime(timestampRel);
+//
+//            EdgeServer targetServer = serversMap.get(nodeId);
+//
+//            if (targetServer == null) {
+//                System.err.println("[Log " + lineNumber + "] Không tìm thấy node " + nodeId);
+//                return;
 //            }
-
-
-
-
-
-            if (!existedBefore) {
-                inserted = targetServer.insertLocalData(dataHash);
-            }
-
-            if (inserted) {
-                ExperimentRecord.allAdd++;
-                notifyNeighborServers(targetServer, dataHash);
-            }
-
-            sendKafkaEvent(timestampRel, dataHash, nodeId, operation);
-
-
-
-
-
-//            try {
-//                //22000log/s
-//                Thread.sleep(1);
 //
-//            } catch (InterruptedException e) {
-//                e.printStackTrace();
+//
+//            if (!"get".equals(operation)) {
+//                sendKafkaEvent(timestampRel, dataHash, nodeId, operation);
+//                return;
 //            }
+//
+//            int distance = MetricCollector.measureDistance(dataHash, targetServer, serversMap);
+//            MetricCollector.recordRequest(dataHash, lineNumber, distance);
+//
+//            boolean existedBefore = targetServer.searchLocalData(dataHash);
+//            boolean inserted = false;
+//
+////            if (!existedBefore && targetServer.getStorageUtilization() >= this.storageUpperLimit) {
+////                int sizeBefore = targetServer.dataTable.size();
+////                double storageBefore = targetServer.getStorageUtilization();
+////
+////                System.out.println(
+////                        "[DEDUP-BEFORE-INSERT] NODE_" + (nodeId+1) +
+////                                " storage=" + String.format("%.4f", storageBefore) +
+////                                " >= " + this.storageUpperLimit +
+////                                ", start deduplicate..."
+////                );
+////
+////                targetServer.deduplicate(this.distancesMatrix, serversMap, new HashMap<>());
+////
+////                int sizeAfter = targetServer.dataTable.size();
+////                double storageAfter = targetServer.getStorageUtilization();
+////                int deleted = sizeBefore - sizeAfter;
+////
+////                System.out.println(
+////                        "[DEDUP-DONE] NODE_" + (nodeId+1) +
+////                                " size before=" + sizeBefore +
+////                                ", after=" + sizeAfter +
+////                                ", deleted=" + deleted +
+////                                ", storage before=" + String.format("%.6f", storageBefore) +
+////                                ", after=" + String.format("%.6f", storageAfter)
+////                );
+////            }
+//
+//
+//
+//
+//
+//            if (!existedBefore) {
+//                if (targetServer.getStorageUtilization() >= this.storageUpperLimit) {
+//                    int sizeBefore = targetServer.dataTable.size();
+//                    double storageBefore = targetServer.getStorageUtilization();
+//
+//                    System.out.println(
+//                            "[DEDUP-BEFORE-INSERT] NODE_" + targetServer.serverID +
+//                                    " size=" + sizeBefore +
+//                                    ", storage=" + String.format("%.6f", storageBefore) +
+//                                    " >= " + this.storageUpperLimit
+//                    );
+//
+//                    targetServer.deduplicate(this.distancesMatrix, serversMap, new HashMap<>());
+//
+//                    int sizeAfter = targetServer.dataTable.size();
+//                    double storageAfter = targetServer.getStorageUtilization();
+//
+//                    System.out.println(
+//                            "[DEDUP-AFTER-INSERT] NODE_" + targetServer.serverID +
+//                                    " size before=" + sizeBefore +
+//                                    ", after=" + sizeAfter +
+//                                    ", deleted=" + (sizeBefore - sizeAfter) +
+//                                    ", storage after=" + String.format("%.6f", storageAfter)
+//                    );
+//                }
+//
+//                inserted = targetServer.insertLocalData(dataHash);
+//            }
+//
+//            if (inserted) {
+//                ExperimentRecord.allAdd++;
+//                notifyNeighborServers(targetServer, dataHash);
+//            }
+//
+//            sendKafkaEvent(timestampRel, dataHash, nodeId, operation);
+//
+//
+//
+//
+//
+////            try {
+////                //22000log/s
+////                Thread.sleep(1);
+////
+////            } catch (InterruptedException e) {
+////                e.printStackTrace();
+////            }
+//
+//
+//
+//
+//        } catch (NumberFormatException e) {
+//            System.err.println("[Log " + lineNumber + "] Lỗi parse số: " + line);
+//        }
+//    }
 
+private boolean processLine(String line, int lineNumber) {
 
+    MetricCollector.currentLineNumber = lineNumber;
+    rateLimiter.acquire();
 
+    String[] columns = line.trim().split("[,\\s]+");
 
-        } catch (NumberFormatException e) {
-            System.err.println("[Log " + lineNumber + "] Lỗi parse số: " + line);
-        }
+    if (columns.length < 6) {
+        System.err.println("[Log " + lineNumber + "] Bỏ qua vì không đủ cột: " + line);
+        return false;
     }
+
+    try {
+        long timestampRel = System.currentTimeMillis();
+
+        String videoId = columns[1].trim();
+        long dataHash = convertVideoIdToLong(videoId);
+
+        long nodeNumber = Long.parseLong(columns[4].trim());
+        int nodeId = (int) Math.floorMod(nodeNumber, totalNodes);
+
+        String operation = columns[5].trim().toLowerCase();
+
+        EdgeServer targetServer = serversMap.get(nodeId);
+
+        if (targetServer == null) {
+            System.err.println("[Log " + lineNumber + "] Không tìm thấy node " + nodeId);
+            return false;
+        }
+
+        // Chỉ GET mới ảnh hưởng đến cache/deduplicate/metric request.
+        // Operation khác bị bỏ qua để pipeline Kafka/Spark/AI chỉ nhận GET request.
+        if (!"get".equals(operation)) {
+            return false;
+        }
+
+        // Tính distance trước khi insert object mới.
+        // Distance này quyết định request hiện tại là Local Hit, Neighbor Hit hay Cloud Request.
+        int distance = MetricCollector.measureDistance(dataHash, targetServer, serversMap);
+
+        // Ghi nhận các metric request: Total Requests, Edge Hit, Cloud Ratio, Latency, Viral metric, Thrashing.
+        MetricCollector.recordRequest(dataHash, lineNumber, distance);
+
+        boolean existedBefore = targetServer.searchLocalData(dataHash);
+        boolean inserted = false;
+
+        if (!existedBefore) {
+            // Nếu cache của node đã vượt ngưỡng storageUpperLimit, thực hiện deduplicate trước khi insert.
+            // Đây là điểm EdgeServer có thể xóa object và gọi MetricCollector.recordEviction(...).
+            if (targetServer.getStorageUtilization() >= this.storageUpperLimit) {
+                int sizeBefore = targetServer.dataTable.size();
+                double storageBefore = targetServer.getStorageUtilization();
+
+                System.out.println(
+                        "[DEDUP-BEFORE-INSERT] NODE_" + targetServer.serverID +
+                                " size=" + sizeBefore +
+                                ", storage=" + String.format("%.6f", storageBefore) +
+                                " >= " + this.storageUpperLimit
+                );
+
+                targetServer.deduplicate(this.distancesMatrix, serversMap, new HashMap<>());
+
+                int sizeAfter = targetServer.dataTable.size();
+                double storageAfter = targetServer.getStorageUtilization();
+
+                System.out.println(
+                        "[DEDUP-AFTER-INSERT] NODE_" + targetServer.serverID +
+                                " size before=" + sizeBefore +
+                                ", after=" + sizeAfter +
+                                ", deleted=" + (sizeBefore - sizeAfter) +
+                                ", storage after=" + String.format("%.6f", storageAfter)
+                );
+            }
+
+            inserted = targetServer.insertLocalData(dataHash);
+        }
+
+        if (inserted) {
+            // allAdd: số object mới được insert thành công vào cache.
+            // Đây là chỉ số Ripple gốc, khác với Total Requests.
+            ExperimentRecord.allAdd++;
+
+            // Cập nhật index cho các node lân cận biết object này đang nằm ở targetServer.
+            notifyNeighborServers(targetServer, dataHash);
+        }
+
+
+
+        // Gửi GET log sang Kafka để Spark/AI Worker tạo feature và dự đoán viral.
+        sendKafkaEvent(timestampRel, dataHash, nodeId, operation);
+
+        return true;
+
+    } catch (NumberFormatException e) {
+        System.err.println("[Log " + lineNumber + "] Lỗi parse số: " + line);
+        return false;
+    }
+}
     private long convertVideoIdToLong(String videoId) {
         try {
             java.security.MessageDigest digest =
@@ -372,6 +536,7 @@ public class RealtimeSendController {
         long timestampAbs = System.currentTimeMillis();
 
         String jsonPayload = String.format(
+                java.util.Locale.US,
                 "{" +
                         "\"timestamp_rel\":%d," +
                         "\"timestamp_abs\":%d," +

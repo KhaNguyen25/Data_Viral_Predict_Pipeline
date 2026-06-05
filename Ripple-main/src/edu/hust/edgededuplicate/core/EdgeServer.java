@@ -14,6 +14,9 @@ public class EdgeServer {
     public final int dataVolume = ConfigurationManager.getRandomIntArrayProperty("dataVolumeOptions");
     private final String deduplicateStrategy = ConfigurationManager.getProperty("deduplicateStrategy");
 
+    private final boolean aiProtectEnabled =
+            Boolean.parseBoolean(ConfigurationManager.getProperty("ai.protect.enabled"));
+
     public int serverID;
     public Map<Integer, NeighborServerInfo> neighborInfoMap = new HashMap<>();//附近server信息
     public HierarchicalTree IndexTree;//索引树
@@ -200,13 +203,6 @@ public class EdgeServer {
         return true;
     }
 
-    public boolean insertLocalData(long data, int[][] distancesMatrix, Map<Integer, EdgeServer> serversMap, Map<Integer, List<EdgeClient>> clientsMap) {
-        if (dataTable.size() >= dataVolume) {
-            deduplicate(distancesMatrix, serversMap, clientsMap);
-            if (dataTable.size() >= dataVolume) return false;
-        }
-        return insertLocalData(data); // Tái sử dụng logic chèn
-    }
 
     /**
      * insert a data to the server
@@ -237,32 +233,108 @@ public class EdgeServer {
     }
 
 
+//    public List<Boolean> getPermission(List<Long> duplicateDataList, Map<Integer, EdgeServer> serversMap) {
+//        List<List<Boolean>> permissionList = new ArrayList<>();
+//        for (Map.Entry<Integer, NeighborServerInfo> entry : neighborInfoMap.entrySet()) {
+//            int neighborServerID = entry.getKey();
+//            EdgeServer neighborServer = serversMap.get(neighborServerID);
+//            List<Boolean> duplicatePermissionList = new ArrayList<>();
+//            for (Long data : duplicateDataList) {
+//                if (neighborServer.searchIndexTreeAllReturnID(data).size() <= 1) {
+//                    duplicatePermissionList.add(false);
+//                } else {
+//                    duplicatePermissionList.add(true);
+//                }
+//            }
+//            permissionList.add(duplicatePermissionList);
+//        }
+//        List<Boolean> permission = new ArrayList<>();
+//        for (int i = 0; i < duplicateDataList.size(); i++) {
+//            boolean canDelete = true;
+//            for (List<Boolean> subList : permissionList) {
+//                if (!subList.get(i)) {
+//                    canDelete = false;
+//                    break;
+//                }
+//            }
+//            permission.add(canDelete);
+//        }
+//        return permission;
+//    }
+
     public List<Boolean> getPermission(List<Long> duplicateDataList, Map<Integer, EdgeServer> serversMap) {
+        /*
+         * Ý nghĩa:
+         * Hàm này xác định object nào trong duplicateDataList được phép xóa khỏi node hiện tại.
+         *
+         * Logic giống Ripple gốc:
+         * - Không duyệt toàn bộ serversMap.
+         * - Chỉ duyệt các server lân cận nằm trong neighborInfoMap.
+         * - neighborInfoMap đã được tạo trước đó theo điều kiện hop <= hopNum.
+         * - Vì vậy, việc kiểm tra quyền xóa có xét phạm vi hop một cách gián tiếp.
+         *
+         * Kết quả:
+         * - permission.get(i) = true  => object duplicateDataList.get(i) được phép xóa.
+         * - permission.get(i) = false => không được xóa object đó.
+         */
+
         List<List<Boolean>> permissionList = new ArrayList<>();
+
+        // Duyệt từng neighbor của server hiện tại.
+        // neighborInfoMap chỉ chứa các server nằm trong phạm vi hopNum.
         for (Map.Entry<Integer, NeighborServerInfo> entry : neighborInfoMap.entrySet()) {
             int neighborServerID = entry.getKey();
             EdgeServer neighborServer = serversMap.get(neighborServerID);
+
+            if (neighborServer == null) {
+                continue;
+            }
+
             List<Boolean> duplicatePermissionList = new ArrayList<>();
+
             for (Long data : duplicateDataList) {
+                /*
+                 * searchIndexTreeAllReturnID(data) trả về danh sách server mà neighbor biết
+                 * là đang có object này.
+                 *
+                 * Nếu số server chứa object <= 1:
+                 *   Không nên xóa, vì object có thể không còn bản sao đủ an toàn.
+                 *
+                 * Nếu số server chứa object > 1:
+                 *   Có thể xóa ở node hiện tại vì object vẫn còn được lưu ở nơi khác
+                 *   trong phạm vi mà neighbor biết.
+                 */
                 if (neighborServer.searchIndexTreeAllReturnID(data).size() <= 1) {
                     duplicatePermissionList.add(false);
                 } else {
                     duplicatePermissionList.add(true);
                 }
             }
+
             permissionList.add(duplicatePermissionList);
         }
+
         List<Boolean> permission = new ArrayList<>();
+
+        /*
+         * Tổng hợp kết quả từ tất cả neighbor.
+         *
+         * Một object chỉ được phép xóa nếu tất cả neighbor đều cho phép.
+         * Nếu chỉ cần một neighbor trả false, object đó không được xóa.
+         */
         for (int i = 0; i < duplicateDataList.size(); i++) {
             boolean canDelete = true;
+
             for (List<Boolean> subList : permissionList) {
                 if (!subList.get(i)) {
                     canDelete = false;
                     break;
                 }
             }
+
             permission.add(canDelete);
         }
+
         return permission;
     }
 
@@ -337,13 +409,45 @@ public class EdgeServer {
             int viralSkipped = 0;
 
 // 删除许可的数据
+            //Xóa tất cả các duplicate được cho phép
+            // 1. Lập danh sách candidate thật sự có quyền xóa
+            Set<Long> candidateIds = new HashSet<>();
+
+            for (int i = 0; i < duplicateDataList.size(); i++) {
+                if (permission.get(i)) {
+                    candidateIds.add(duplicateDataList.get(i));
+                }
+            }
+
+// 2. Gọi Redis MGET một lần để lấy danh sách object viral
+            Set<Long> viralCandidateSet = Collections.emptySet();
+
+            if (aiProtectEnabled && !candidateIds.isEmpty()) {
+                long redisStartNs = System.nanoTime();
+
+                viralCandidateSet = RedisUtility.getViralVideoIds(candidateIds);
+
+                long redisEndNs = System.nanoTime();
+
+                System.out.println(
+                        "[Smart-Dedup][MGET] Server=" + serverID
+                                + ", candidates=" + duplicateDataList.size()
+                                + ", deletableCandidates=" + candidateIds.size()
+                                + ", viralFound=" + viralCandidateSet.size()
+                                + ", redisMgetTimeMs=" + String.format("%.3f", (redisEndNs - redisStartNs) / 1_000_000.0)
+                );
+            }
+
+// 3. Duyệt danh sách xóa như cũ, nhưng không gọi Redis GET từng object nữa
             for (int i = 0; i < duplicateDataList.size(); i++) {
                 Long data = duplicateDataList.get(i);
 
                 if (permission.get(i)) {
-                    if (RedisUtility.isVideoViral(data.intValue())) {
+                    if (aiProtectEnabled && viralCandidateSet.contains(data)) {
                         viralSkipped++;
-                        logger.info("[Smart-Dedup] Bỏ qua xóa video viral: " + data);
+
+                        // Khi benchmark, không nên log từng object vì có thể làm chậm hệ thống.
+                        // logger.info("[Smart-Dedup] Bỏ qua xóa video viral: " + data);
                         continue;
                     }
 
@@ -351,6 +455,7 @@ public class EdgeServer {
 
                     if (deleted) {
                         realDeleted++;
+                        MetricCollector.recordEviction(data, MetricCollector.currentLineNumber);
 
                         // server通知附近服务器更新索引树
                         for (Map.Entry<Integer, NeighborServerInfo> entry : neighborInfoMap.entrySet()) {
@@ -370,6 +475,49 @@ public class EdgeServer {
                     }
                 }
             }
+
+
+//            Xóa ở ngưỡn 80%(giống bài báo)
+//            double storageUpperLimit = ConfigurationManager.getDoubleProperty("storageUpperLimit");
+//            int targetSize = (int) Math.floor(dataVolume * storageUpperLimit);
+//            int maxDeleteNeeded = Math.max(0, dataTable.size() - targetSize);
+//
+//            for (int i = 0; i < duplicateDataList.size(); i++) {
+//                if (realDeleted >= maxDeleteNeeded) {
+//                    break;
+//                }
+//
+//                Long data = duplicateDataList.get(i);
+//
+//                if (permission.get(i)) {
+//                    if (RedisUtility.isVideoViral(data)) {
+//                        viralSkipped++;
+//                        logger.info("[Smart-Dedup] Bỏ qua xóa video viral: " + data);
+//                        continue;
+//                    }
+//
+//                    boolean deleted = deleteLocalData(data);
+//
+//                    if (deleted) {
+//                        realDeleted++;
+//
+//                        for (Map.Entry<Integer, NeighborServerInfo> entry : neighborInfoMap.entrySet()) {
+//                            int neighborServerID = entry.getKey();
+//                            int hop = entry.getValue().hop;
+//                            EdgeServer neighborServer = serversMap.get(neighborServerID);
+//
+//                            if (neighborServer == null) {
+//                                continue;
+//                            }
+//
+//                            UpdateMessage updateMessage =
+//                                    new UpdateMessage("delete", serverID, data, hop);
+//
+//                            neighborServer.updateIndex(updateMessage);
+//                        }
+//                    }
+//                }
+//            }
 
             System.out.println(
                     "[DEDUP-DEBUG] Server " + serverID +
@@ -443,6 +591,24 @@ public class EdgeServer {
             List<Integer> allServerID = new ArrayList<>(neighborInfoMap.keySet());
             allServerID.add(serverID);
 
+
+            Set<Long> viralCandidateSet = Collections.emptySet();
+
+            if (aiProtectEnabled && !dataPermission.isEmpty()) {
+                long redisStartNs = System.nanoTime();
+
+                viralCandidateSet = RedisUtility.getViralVideoIds(dataPermission.keySet());
+
+                long redisEndNs = System.nanoTime();
+
+                System.out.println(
+                        "[Smart-Dedup][MGET-Latency] Server=" + serverID
+                                + ", candidates=" + dataPermission.size()
+                                + ", viralFound=" + viralCandidateSet.size()
+                                + ", redisMgetTimeMs=" + String.format("%.3f", (redisEndNs - redisStartNs) / 1_000_000.0)
+                );
+            }
+
             for (Map.Entry<Long, List<Integer>> entry : dataPermission.entrySet()) {
                 // 计算延迟
                 List<Integer> serversIDSaveData = entry.getValue();
@@ -463,7 +629,7 @@ public class EdgeServer {
 
                 Long videoHash = entry.getKey();
                 // --- KIỂM TRA TRƯỚC KHI YÊU CẦU SERVER XÓA ---
-                if (RedisUtility.isVideoViral(videoHash.intValue())) {
+                if (aiProtectEnabled && viralCandidateSet.contains(videoHash)) {
                     logger.info("[Smart-Dedup] Video " + videoHash + " đang viral. Hủy lệnh xóa để bảo vệ băng thông.");
                     continue;
                 }

@@ -67,13 +67,27 @@ public class Main {
 
             System.out.println("\n" + "=".repeat(20) + " BÁO CÁO KẾT QUẢ RIPPLE " + "=".repeat(20));
 
+            // allAdd: số object mới được insert thành công vào cache của các Edge node.
+            // Chỉ số này khác Total Requests vì một request chỉ làm allAdd tăng nếu object chưa có trong local cache.
             System.out.println("1. Tổng số Log/Video đã thêm (allAdd)  : " + ExperimentRecord.allAdd);
+            // allDelete: số lần hệ thống thực hiện lệnh xóa object trong Ripple.
             System.out.println("2. Tổng số Video đã xóa (allDelete)    : " + ExperimentRecord.allDelete);
+            // dedupRate: tỷ lệ xóa trên số object đã thêm.
+            // Công thức: dedupRate = allDelete / allAdd.
+            // Ý nghĩa: phản ánh mức độ hệ thống phải loại bỏ object trong quá trình deduplicate.
             System.out.println("3. Tỷ lệ xóa trùng lặp (dedupRate)     : " +
                     String.format("%.6f", (ExperimentRecord.allAdd == 0
                             ? 0.0
                             : (ExperimentRecord.allDelete * 1.0 / ExperimentRecord.allAdd))));
+            // dupSum: tổng số lần hàm EdgeServer.deduplicate(...) được gọi.
             System.out.println("4. Số lần gọi deduplicate              : " + ExperimentRecord.dupSum);
+
+            // In và xuất các chỉ số EDGE/AI METRICS:
+            // Total Requests, Edge Hit Ratio, Cloud Backhaul Ratio, Average Latency,
+            // Evicted Files, Cache Thrashing Count, Avg Storage Utilization, Dedup Efficiency Score, ...
+            MetricCollector.printReport();
+            MetricCollector.exportCsv();
+            MetricCollector.clear();
 
             // Xuất ra file log của hệ thống
             logger.info(experimentRecord.toString());
